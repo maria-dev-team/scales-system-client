@@ -1,0 +1,64 @@
+name: Release Windows
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  release-windows:
+    name: Build and publish Windows installer
+    runs-on: windows-latest
+    env:
+      VITE_API_URL: ${{ vars.SCALES_API_URL }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v5
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Validate release configuration
+        shell: pwsh
+        run: |
+          $tagMatch = [regex]::Match($env:RELEASE_TAG, '^v(?<version>\d+\.\d+\.\d+)$')
+          if (-not $tagMatch.Success) {
+            throw "Release tag '$env:RELEASE_TAG' must use the vMAJOR.MINOR.PATCH format."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:VITE_API_URL)) {
+            throw "Repository variable SCALES_API_URL is required."
+          }
+          $releaseVersion = $tagMatch.Groups['version'].Value
+          "RELEASE_VERSION=$releaseVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set application version from release tag
+        shell: pwsh
+        run: npm version $env:RELEASE_VERSION --no-git-tag-version --allow-same-version
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Build and publish release
+        run: npm run release:win
+        env:
+          GH_TOKEN: ${{ github.token }}

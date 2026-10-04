@@ -60,7 +60,28 @@ npm start
 `npm run build` создаёт `out/`. `npm start` открывает собранное приложение.
 `npm run build:win` на Windows создаёт NSIS-установщик x64 в `dist/`.
 Workflow Build выполняет проверки и сборку установщика на Windows.
-Подпись, автообновление и публикация релизов пока не настроены.
+Отдельный workflow Lint проверяет ESLint и форматирование на Ubuntu.
+Оба запускаются для PR в `main` или вручную. Dependabot ежемесячно проверяет
+обновления npm-зависимостей. Конфигурации и шаблон PR взяты из `pos-system-client`.
 
-Архитектура описана в [ARCHITECTURE.md](./ARCHITECTURE.md), правила PR —
-в [AGENTS.md](./AGENTS.md).
+## Релизы Windows
+
+Workflow Release Windows собирает и загружает установщик при публикации
+GitHub Release. В **Settings → Secrets and variables → Actions → Variables**
+задайте `SCALES_API_URL` — корневой HTTPS URL production API без `/v1`.
+
+Создайте релиз из `main` с тегом `vMAJOR.MINOR.PATCH`, например `v0.1.0`, и
+опубликуйте его. Workflow возьмёт версию из тега, выполнит проверки и вызовет
+`npm run release:win`. Версию в `package.json` перед релизом менять не нужно.
+Для загрузки используется встроенный GitHub token с правом `contents: write`.
+
+Постоянный адрес последнего установщика:
+
+```text
+https://github.com/maria-dev-team/scales-system-client/releases/latest/download/dukenai-scales-setup.exe
+```
+
+Для приватного репозитория скачивание требует авторизации GitHub.
+Подпись установщика и автообновление внутри приложения пока не настроены.
+
+Архитектура описана в [ARCHITECTURE.md](./ARCHITECTURE.md).

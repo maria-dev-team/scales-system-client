@@ -1,0 +1,103 @@
+{
+  "name": "scales-system-client",
+  "version": "0.1.0",
+  "description": "DukenAI Scales desktop application",
+  "main": "./out/main/index.js",
+  "author": "Maria Dev Team",
+  "homepage": "https://github.com/maria-dev-team/scales-system-client",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maria-dev-team/scales-system-client.git"
+  },
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint --cache .",
+    "test": "vitest run",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
+    "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "start": "electron-vite preview",
+    "dev": "electron-vite dev",
+    "build": "npm run typecheck && electron-vite build",
+    "postinstall": "electron-builder install-app-deps",
+    "build:win": "npm run build && electron-builder --win --publish never",
+    "release:win": "npm run build && electron-builder --win --publish always"
+  },
+  "build": {
+    "appId": "kz.maria.scales",
+    "productName": "DukenAI Scales",
+    "asar": true,
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "win": {
+      "executableName": "DukenAIScales",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "artifactName": "dukenai-scales-setup.${ext}",
+      "shortcutName": "${productName}",
+      "uninstallDisplayName": "${productName}",
+      "createDesktopShortcut": "always"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "maria-dev-team",
+        "repo": "scales-system-client",
+        "releaseType": "release"
+      }
+    ]
+  },
+  "dependencies": {
+    "@electron-toolkit/utils": "4.0.0",
+    "@tanstack/react-query": "5.102.1",
+    "axios": "1.19.0",
+    "clsx": "2.1.1",
+    "lucide-react": "1.33.0",
+    "tailwind-merge": "3.6.0",
+    "zod": "4.4.3",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@electron-toolkit/eslint-config-prettier": "3.0.0",
+    "@electron-toolkit/eslint-config-ts": "3.1.0",
+    "@electron-toolkit/tsconfig": "2.0.0",
+    "@tailwindcss/vite": "4.3.3",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.6",
+    "@trivago/prettier-plugin-sort-imports": "6.0.2",
+    "@types/node": "26.6.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "5.2.0",
+    "electron": "39.8.10",
+    "electron-builder": "26.15.3",
+    "electron-vite": "5.0.0",
+    "eslint": "9.39.5",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "eslint-plugin-react-refresh": "0.5.5",
+    "jsdom": "29.1.1",
+    "prettier": "3.9.6",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "tailwindcss": "4.3.3",
+    "typescript": "5.9.3",
+    "vite": "7.3.6",
+    "vitest": "4.1.11"
+  }
+}

@@ -1,0 +1,27 @@
+node_modules
+dist
+out
+.DS_Store
+.eslintcache
+*.log*
+logs
+*.local
+
+# Environment variables
+.env*
+!.env.example
+
+# Local agent instructions
+AGENTS.md
+CLAUDE.md
+
+# Local reference docs
+/docs/
+
+# Locally provisioned release binaries
+/resources/ffmpeg
+/resources/ffmpeg.exe
+
+# IDE
+.idea
+.vscode

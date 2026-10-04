@@ -1,0 +1,38 @@
+name: Build
+
+on:
+  pull_request:
+    branches: ['main']
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build
+    runs-on: windows-latest
+    env:
+      VITE_API_URL: http://localhost:4004
+
+    steps:
+      - name: Checkout pull request
+        uses: actions/checkout@v5
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Build Windows installer
+        run: npm run build:win
