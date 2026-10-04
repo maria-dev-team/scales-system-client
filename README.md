@@ -62,5 +62,4 @@ npm start
 Workflow Build выполняет проверки и сборку установщика на Windows.
 Подпись, автообновление и публикация релизов пока не настроены.
 
-Архитектура описана в [ARCHITECTURE.md](./ARCHITECTURE.md), правила PR —
-в [AGENTS.md](./AGENTS.md).
+Архитектура описана в [ARCHITECTURE.md](./ARCHITECTURE.md).
