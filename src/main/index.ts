@@ -3,7 +3,11 @@ import { BrowserWindow, app, net, protocol } from 'electron';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
 
+import { registerDiagnosticsIpc } from './diagnostics/ipc';
+import { DiagnosticsService } from './diagnostics/service';
 import { resolveRendererFilePath } from './renderer-protocol';
+
+let diagnostics: DiagnosticsService | null = null;
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -61,8 +65,19 @@ if (!app.requestSingleInstanceLock()) {
     window?.focus();
   });
 
-  void app.whenReady().then(() => {
+  void app.whenReady().then(async () => {
     electronApp.setAppUserModelId('kz.maria.scales');
+    app.setAppLogsPath();
+    diagnostics = new DiagnosticsService({
+      dataDirectory: app.getPath('userData'),
+      logsDirectory: app.getPath('logs'),
+      appVersion: app.getVersion(),
+    });
+    await diagnostics.initialize();
+    registerDiagnosticsIpc(
+      diagnostics,
+      is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined,
+    );
     const rendererRoot = join(__dirname, '../renderer');
     protocol.handle('maria', (request) => {
       const filePath = resolveRendererFilePath(rendererRoot, request.url);
@@ -82,4 +97,10 @@ if (!app.requestSingleInstanceLock()) {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', (event) => {
+  if (!diagnostics?.isRunning()) return;
+  event.preventDefault();
+  void diagnostics.cancel().finally(() => app.quit());
 });
