@@ -21,7 +21,8 @@
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "postinstall": "electron-builder install-app-deps",
-    "build:win": "npm run build && electron-builder --win --publish never"
+    "build:win": "npm run build && electron-builder --win --publish never",
+    "release:win": "npm run build && electron-builder --win --publish always"
   },
   "build": {
     "appId": "kz.maria.scales",
@@ -51,7 +52,15 @@
       "shortcutName": "${productName}",
       "uninstallDisplayName": "${productName}",
       "createDesktopShortcut": "always"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "maria-dev-team",
+        "repo": "scales-system-client",
+        "releaseType": "release"
+      }
+    ]
   },
   "dependencies": {
     "@electron-toolkit/utils": "4.0.0",
