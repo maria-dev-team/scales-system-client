@@ -10,11 +10,21 @@ export function formatReport(run: DiagnosticRun): string {
     `Начало: ${run.startedAt}`,
     `Окончание: ${run.finishedAt ?? 'ещё выполняется'}`,
     `Состояние запуска: ${run.status}`,
-    `Протокол весов: ${run.protocolStatus} (не проверен; команды PLU не отправлялись)`,
+    `Протокол весов: ${run.protocolStatus}${
+      run.transferTest
+        ? ' (тест записи; подтверждение пакетов не является проверкой печати)'
+        : ' (не проверен; команды PLU не отправлялись)'
+    }`,
     `Каталог: ${run.reportDirectory}`,
     `Ошибка сохранения: ${run.persistenceError ?? 'нет'}`,
     `Профиль: ${JSON.stringify(run.profile)}`,
-    `Тестовый товар (локальный): ${JSON.stringify(run.testProduct)}`,
+    `Тестовый товар: ${JSON.stringify(run.testProduct)}`,
+    ...(run.transferTest
+      ? [
+          `Параметры передачи: ${JSON.stringify(run.transferTest)}`,
+          `Печать (со слов оператора): ${JSON.stringify(run.printObservation ?? null)}`,
+        ]
+      : []),
     '',
   ];
   for (const step of run.steps) {

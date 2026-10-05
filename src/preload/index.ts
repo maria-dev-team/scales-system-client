@@ -9,6 +9,10 @@ const diagnostics: DiagnosticsApi = {
   rerun: () => ipcRenderer.invoke('diagnostics:rerun'),
   cancel: () => ipcRenderer.invoke('diagnostics:cancel'),
   exportReport: () => ipcRenderer.invoke('diagnostics:export'),
+  startTransferTest: (options) =>
+    ipcRenderer.invoke('diagnostics:transfer-test', options),
+  recordPrintResult: (input) =>
+    ipcRenderer.invoke('diagnostics:print-result', input),
 };
 
 contextBridge.exposeInMainWorld('diagnostics', diagnostics);

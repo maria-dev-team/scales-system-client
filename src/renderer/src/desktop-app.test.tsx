@@ -89,6 +89,34 @@ beforeEach(() => {
       canceled: false,
       path: 'C:\\Desktop\\run-1',
     })),
+    startTransferTest: vi.fn(async (transferTest) => {
+      state = {
+        ...state,
+        run: {
+          ...state.run!,
+          id: 'transfer-1',
+          status: 'running',
+          profile: state.profile,
+          transferTest,
+          protocolStatus: 'unverified',
+        },
+      };
+      return state;
+    }),
+    recordPrintResult: vi.fn(async (input) => {
+      state = {
+        ...state,
+        run: {
+          ...state.run!,
+          printObservation: {
+            ...input,
+            source: 'operator',
+            recordedAt: '2026-10-05T10:00:00Z',
+          },
+        },
+      };
+      return state;
+    }),
   };
   Object.defineProperty(window, 'diagnostics', {
     configurable: true,
@@ -115,6 +143,7 @@ describe('autonomous desktop diagnostics', () => {
     expect(screen.getByText('Не выполнено: требуется IP')).toBeVisible();
     expect(screen.getByText('TEST APPLE')).toBeVisible();
     expect(api.rerun).not.toHaveBeenCalled();
+    expect(api.startTransferTest).not.toHaveBeenCalled();
     expect(mariaLoaded).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: 'Maria' }));
     expect(screen.getByRole('alert')).toHaveTextContent(
@@ -244,5 +273,118 @@ describe('autonomous desktop diagnostics', () => {
         'Запустите установленное приложение',
       ),
     );
+  });
+
+  it('requires a saved target and an explicit action to transfer the test product', async () => {
+    const user = userEvent.setup();
+    render(<DesktopApp />);
+    expect(
+      await screen.findByRole('button', { name: 'Передать TEST APPLE' }),
+    ).toBeDisabled();
+    expect(api.startTransferTest).not.toHaveBeenCalled();
+    await user.type(screen.getByLabelText('IP весов'), '192.168.1.87');
+    await user.selectOptions(
+      screen.getByLabelText('Ethernet-адаптер'),
+      '192.168.1.2',
+    );
+    await user.click(
+      screen.getByRole('button', { name: 'Сохранить и проверить' }),
+    );
+    expect(
+      screen.getByRole('button', { name: 'Передать TEST APPLE' }),
+    ).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: 'Остановить' }));
+    await user.type(screen.getByLabelText('IP весов'), '9');
+    expect(screen.getByText('192.168.1.87:5001')).toBeVisible();
+    await user.selectOptions(
+      screen.getByLabelText('Знаков после запятой в цене на весах'),
+      '3',
+    );
+    expect(api.startTransferTest).not.toHaveBeenCalled();
+    await user.click(
+      screen.getByRole('button', { name: 'Передать TEST APPLE' }),
+    );
+    expect(api.startTransferTest).toHaveBeenCalledExactlyOnceWith({
+      priceDecimals: 3,
+    });
+    expect(
+      screen.getByRole('button', { name: 'Передать TEST APPLE' }),
+    ).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: 'Остановить' }));
+    await user.click(screen.getByRole('button', { name: 'Повторить' }));
+    expect(api.startTransferTest).toHaveBeenCalledTimes(1);
+  });
+
+  it('records physical printing only after the operator explicitly supplies an observation', async () => {
+    state.profile = {
+      scaleIp: '192.168.1.87',
+      port: 5001,
+      localAddress: '192.168.1.2',
+    };
+    state.run = {
+      ...state.run!,
+      id: 'transfer-previous',
+      profile: state.profile,
+      transferTest: { priceDecimals: 2 },
+      protocolStatus: 'write-acknowledged',
+    };
+    const user = userEvent.setup();
+    render(<DesktopApp />);
+    await screen.findByText('Windows x64');
+    expect(api.recordPrintResult).not.toHaveBeenCalled();
+    expect(
+      screen.queryByText(/Записано со слов оператора/),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Проверка печати' }));
+    expect(screen.getByText(/PLU → 900001 → PLU/)).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Записать результат печати' }),
+    ).toBeDisabled();
+    await user.selectOptions(
+      screen.getByLabelText('Результат на весах'),
+      'wrong-data',
+    );
+    await user.type(
+      screen.getByLabelText('Наблюдение оператора'),
+      'Цена 1.234 вместо 12.34; вес 1 кг; сумма 1.234; штрихкод 123',
+    );
+    expect(api.recordPrintResult).not.toHaveBeenCalled();
+    await user.click(
+      screen.getByRole('button', { name: 'Записать результат печати' }),
+    );
+    expect(api.recordPrintResult).toHaveBeenCalledExactlyOnceWith({
+      runId: 'transfer-previous',
+      outcome: 'wrong-data',
+      note: 'Цена 1.234 вместо 12.34; вес 1 кг; сумма 1.234; штрихкод 123',
+    });
+    expect(await screen.findByText(/Записано со слов оператора/)).toBeVisible();
+    expect(api.startTransferTest).not.toHaveBeenCalled();
+  });
+
+  it.each(['unverified', 'write-acknowledged'] as const)(
+    'does not offer print confirmation for an unfinished transfer (%s)',
+    async (protocolStatus) => {
+      state.run = {
+        ...state.run!,
+        status: 'running',
+        transferTest: { priceDecimals: 2 },
+        protocolStatus,
+      };
+      render(<DesktopApp />);
+      await screen.findByText('Windows x64');
+      expect(
+        screen.queryByRole('button', { name: 'Проверка печати' }),
+      ).not.toBeInTheDocument();
+      expect(api.recordPrintResult).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not offer print confirmation without an acknowledged transfer', async () => {
+    state.run = { ...state.run!, transferTest: { priceDecimals: 2 } };
+    render(<DesktopApp />);
+    await screen.findByText('Windows x64');
+    expect(
+      screen.queryByRole('button', { name: 'Проверка печати' }),
+    ).not.toBeInTheDocument();
   });
 });

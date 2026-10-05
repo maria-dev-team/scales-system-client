@@ -10,6 +10,7 @@ import type {
   DiagnosticState,
   DiagnosticStep,
 } from '../../../../shared/diagnostics';
+import { HardwareTest } from './hardware-test';
 
 const statusLabels: Record<DiagnosticStep['status'], string> = {
   pending: 'Ожидание',
@@ -402,10 +403,15 @@ export function DiagnosticsView() {
           </p>
         </div>
         <div className="rounded-xl border border-warning/20 bg-warning-muted/40 p-4">
-          <h2 className="text-sm font-semibold">03 · Протокол не проверен</h2>
+          <h2 className="text-sm font-semibold">
+            {run?.protocolStatus === 'write-acknowledged'
+              ? '03 · Получен ACK записи'
+              : '03 · Протокол не проверен'}
+          </h2>
           <p className="mt-2 text-xs leading-5 text-muted-foreground">
-            Ping и UDP на ПК не подтверждают загрузку товаров. Каталог весов не
-            изменяется.
+            {run?.protocolStatus === 'write-acknowledged'
+              ? 'Ответ на передачу получен. Правильность товара и печати проверьте на весах.'
+              : 'Автопроверка не изменяет каталог. Передача тестового товара запускается отдельно; ping не подтверждает загрузку.'}
           </p>
         </div>
       </div>
@@ -451,9 +457,24 @@ export function DiagnosticsView() {
                 </dd>
               </dl>
               <p className="mt-4 text-xs leading-5 text-muted-foreground">
-                Локальный пример для следующего этапа. На весы не отправляется.
+                Сохранённый образец для явного теста передачи. Автоматически не
+                отправляется.
               </p>
             </section>
+            <HardwareTest
+              state={state}
+              busy={busy}
+              onTransfer={(options) =>
+                void perform(async () =>
+                  setState(await api!.startTransferTest(options)),
+                )
+              }
+              onRecord={(input) =>
+                void perform(async () =>
+                  setState(await api!.recordPrintResult(input)),
+                )
+              }
+            />
           </aside>
           <section className="min-w-0 overflow-hidden rounded-xl border bg-card">
             <div className="border-b p-5">

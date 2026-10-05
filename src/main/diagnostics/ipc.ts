@@ -35,6 +35,14 @@ export function registerDiagnosticsIpc(
     authorize(event);
     return service.cancel();
   });
+  ipcMain.handle('diagnostics:transfer-test', (event, options: unknown) => {
+    authorize(event);
+    return service.startTransferTest(options);
+  });
+  ipcMain.handle('diagnostics:print-result', (event, input: unknown) => {
+    authorize(event);
+    return service.recordPrintResult(input);
+  });
   ipcMain.handle('diagnostics:export', async (event) => {
     authorize(event);
     const choice = await dialog.showOpenDialog({

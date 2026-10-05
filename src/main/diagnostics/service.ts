@@ -9,6 +9,9 @@ import type {
   DiagnosticProfile,
   DiagnosticRun,
   DiagnosticState,
+  DiagnosticStep,
+  PrintObservation,
+  TransferTestOptions,
 } from '../../shared/diagnostics';
 import { checkPluFixture } from './plu';
 import {
@@ -23,6 +26,7 @@ import {
   validateProfile,
 } from './probes';
 import { writeReport } from './report';
+import { transferTestProduct } from './transfer';
 
 interface ServiceOptions {
   dataDirectory: string;
@@ -96,6 +100,88 @@ export class DiagnosticsService {
     return this.getState();
   }
 
+  startTransferTest(input: unknown): DiagnosticState {
+    if (this.active || this.configuring)
+      throw new Error('Дождитесь завершения или остановите текущие проверки.');
+    if (
+      !input ||
+      typeof input !== 'object' ||
+      Array.isArray(input) ||
+      !('priceDecimals' in input) ||
+      (input.priceDecimals !== 2 && input.priceDecimals !== 3)
+    )
+      throw new Error(
+        'Для цены 12.34 выберите 2 или 3 десятичных разряда, как на весах.',
+      );
+    const adapters = getNetworkAdapters();
+    const profile = validateProfile(this.state.profile, adapters);
+    if (checkSubnet(profile, adapters).status !== 'passed')
+      throw new Error(
+        'Для тестовой передачи ПК и весы должны находиться в одной подсети.',
+      );
+    this.startRun({ priceDecimals: input.priceDecimals });
+    return this.getState();
+  }
+
+  async recordPrintResult(input: unknown): Promise<DiagnosticState> {
+    const run = this.state.run;
+    if (
+      this.active ||
+      this.configuring ||
+      !run?.transferTest ||
+      run.status !== 'completed' ||
+      run.protocolStatus !== 'write-acknowledged'
+    )
+      throw new Error(
+        'Сначала завершите передачу тестового товара с подтверждением весов.',
+      );
+    if (
+      !input ||
+      typeof input !== 'object' ||
+      Array.isArray(input) ||
+      !('runId' in input) ||
+      input.runId !== run.id ||
+      !('outcome' in input) ||
+      typeof input.outcome !== 'string' ||
+      !['printed-correctly', 'wrong-data', 'not-printed'].includes(
+        input.outcome,
+      ) ||
+      !('note' in input) ||
+      typeof input.note !== 'string' ||
+      input.note.length > 1000
+    )
+      throw new Error(
+        'Неверный результат печати или устаревший запуск. Комментарий — до 1000 символов.',
+      );
+    this.configuring = true;
+    try {
+      const observation: PrintObservation = {
+        runId: run.id,
+        outcome: input.outcome as PrintObservation['outcome'],
+        note: input.note.trim(),
+        recordedAt: new Date().toISOString(),
+        source: 'operator',
+      };
+      run.printObservation = observation;
+      const step = run.steps.find((item) => item.id === 'print-test')!;
+      step.status =
+        observation.outcome === 'printed-correctly' ? 'passed' : 'failed';
+      step.summary =
+        observation.outcome === 'printed-correctly'
+          ? 'Оператор подтвердил название, цену и печать этикетки.'
+          : observation.outcome === 'wrong-data'
+            ? 'Оператор обнаружил неверные данные на этикетке.'
+            : 'Оператор сообщил, что этикетка не напечатана.';
+      step.details = observation;
+      step.finishedAt = observation.recordedAt;
+      await this.persist(run);
+      if (run.persistenceError) throw new Error(run.persistenceError);
+      return this.getState();
+    } finally {
+      this.configuring = false;
+    }
+  }
+
   private async loadAndStart(): Promise<void> {
     this.state.interfaces = getNetworkAdapters();
     try {
@@ -136,7 +222,7 @@ export class DiagnosticsService {
     await rename(`${file}.tmp`, file);
   }
 
-  private startRun(): void {
+  private startRun(transferTest?: TransferTestOptions): void {
     const startedAt = new Date().toISOString();
     const id = `${startedAt.replace(/[:.]/g, '-')}-${randomUUID()}`;
     const run: DiagnosticRun = {
@@ -156,6 +242,12 @@ export class DiagnosticsService {
         ['reachability', 'Доступность IP весов'],
         ['arp', 'Таблица соседей ARP'],
         ['udp-bind', 'UDP-сокет выбранного адаптера'],
+        ...(transferTest
+          ? [
+              ['device-transfer', 'Передача TEST APPLE на весы'],
+              ['print-test', 'Проверка печати оператором'],
+            ]
+          : []),
       ].map(([stepId, title]) => ({
         id: stepId,
         title,
@@ -165,6 +257,7 @@ export class DiagnosticsService {
       reportDirectory: join(this.options.logsDirectory, 'diagnostics', id),
       persistenceError: null,
       protocolStatus: 'unverified',
+      ...(transferTest ? { transferTest } : {}),
     };
     this.state.run = run;
     const controller = new AbortController();
@@ -199,7 +292,19 @@ export class DiagnosticsService {
       const start = Date.now();
       step.startedAt = new Date(start).toISOString();
       try {
-        Object.assign(step, await this.perform(step.id, run.profile, signal));
+        const result =
+          step.id === 'device-transfer'
+            ? await this.transfer(run, step, signal)
+            : step.id === 'print-test'
+              ? {
+                  status: 'skipped' as const,
+                  summary:
+                    run.protocolStatus === 'write-acknowledged'
+                      ? 'Напечатайте этикетку на весах и зафиксируйте результат ниже. Ответ на запись не подтверждает печать.'
+                      : 'Не выполнено: передача товара не подтверждена весами.',
+                }
+              : await this.perform(step.id, run.profile, signal);
+        Object.assign(step, result);
       } catch (error) {
         step.status = signal.aborted ? 'cancelled' : 'failed';
         step.summary = String(error);
@@ -211,6 +316,32 @@ export class DiagnosticsService {
     run.status = signal.aborted ? 'cancelled' : 'completed';
     run.finishedAt = new Date().toISOString();
     await this.persist(run);
+  }
+
+  private async transfer(
+    run: DiagnosticRun,
+    step: DiagnosticStep,
+    signal: AbortSignal,
+  ): Promise<CheckResult> {
+    if (run.persistenceError) throw new Error(run.persistenceError);
+    const profile = validateProfile(run.profile, getNetworkAdapters());
+    if (checkSubnet(profile, getNetworkAdapters()).status !== 'passed')
+      throw new Error(
+        'Подсеть изменилась. Проверьте подключение перед передачей.',
+      );
+    const result = await transferTestProduct(
+      profile,
+      run.transferTest!,
+      signal,
+      async (progress) => {
+        Object.assign(step, progress, { status: 'running' });
+        await this.persist(run);
+        if (run.persistenceError) throw new Error(run.persistenceError);
+      },
+    );
+    if (result.status === 'passed' && !signal.aborted)
+      run.protocolStatus = 'write-acknowledged';
+    return result;
   }
 
   private async perform(

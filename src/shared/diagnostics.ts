@@ -79,7 +79,24 @@ export interface DiagnosticRun {
   steps: DiagnosticStep[];
   reportDirectory: string;
   persistenceError: string | null;
-  protocolStatus: 'unverified';
+  protocolStatus: 'unverified' | 'write-acknowledged';
+  transferTest?: TransferTestOptions;
+  printObservation?: PrintObservation;
+}
+
+export interface TransferTestOptions {
+  priceDecimals: 2 | 3;
+}
+
+export interface PrintTestInput {
+  runId: string;
+  outcome: 'printed-correctly' | 'wrong-data' | 'not-printed';
+  note: string;
+}
+
+export interface PrintObservation extends PrintTestInput {
+  recordedAt: string;
+  source: 'operator';
 }
 
 export interface DiagnosticState {
@@ -96,4 +113,6 @@ export interface DiagnosticsApi {
   rerun(): Promise<DiagnosticState>;
   cancel(): Promise<DiagnosticState>;
   exportReport(): Promise<{ canceled: boolean; path?: string }>;
+  startTransferTest(options: TransferTestOptions): Promise<DiagnosticState>;
+  recordPrintResult(input: PrintTestInput): Promise<DiagnosticState>;
 }

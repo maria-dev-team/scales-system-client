@@ -7,6 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CheckResult } from '../../shared/diagnostics';
 import * as probes from './probes';
 import { DiagnosticsService } from './service';
+import { transferTestProduct } from './transfer';
+
+vi.mock('./transfer', () => ({ transferTestProduct: vi.fn() }));
 
 vi.mock('./probes', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./probes')>();
@@ -64,6 +67,171 @@ async function finished(): Promise<void> {
 }
 
 describe('DiagnosticsService', () => {
+  it('never transmits products during startup or an ordinary repeat', async () => {
+    await service.initialize();
+    await finished();
+    service.rerun();
+    await finished();
+    expect(transferTestProduct).not.toHaveBeenCalled();
+  });
+
+  it('requires a valid saved profile and decimal setting before a manual transfer', async () => {
+    await service.initialize();
+    await finished();
+    expect(() => service.startTransferTest({ priceDecimals: 2 })).toThrow();
+    await service.saveProfile({
+      scaleIp: '192.168.50.10',
+      localAddress: '192.168.50.2',
+      port: 5001,
+    });
+    await finished();
+    expect(() => service.startTransferTest({ priceDecimals: 1 })).toThrow();
+    expect(transferTestProduct).not.toHaveBeenCalled();
+  });
+
+  it('persists transfer evidence and keeps operator print verification separate from ACK', async () => {
+    await service.initialize();
+    await finished();
+    await service.saveProfile({
+      scaleIp: '192.168.50.10',
+      localAddress: '192.168.50.2',
+      port: 5001,
+    });
+    await finished();
+    vi.mocked(transferTestProduct).mockImplementationOnce(
+      async (_profile, _options, _signal, progress) => {
+        await progress({
+          status: 'warning',
+          summary: 'Waiting for ACK',
+          details: { txHex: '0e0100' },
+        });
+        const pending = JSON.parse(
+          await readFile(
+            join(service.getState().run!.reportDirectory, 'report.json'),
+            'utf8',
+          ),
+        );
+        expect(
+          pending.steps.find(
+            (step: { id: string }) => step.id === 'device-transfer',
+          ).details.txHex,
+        ).toBe('0e0100');
+        return {
+          status: 'passed',
+          summary: 'ACK received',
+          details: { txHex: '0e0100', rxHex: '02' },
+        };
+      },
+    );
+    service.startTransferTest({ priceDecimals: 2 });
+    expect(() => service.startTransferTest({ priceDecimals: 2 })).toThrow();
+    await finished();
+    const run = service.getState().run!;
+    expect(run.protocolStatus).toBe('write-acknowledged');
+    expect(run.printObservation).toBeUndefined();
+    expect(run.steps.find((s) => s.id === 'print-test')?.status).toBe(
+      'skipped',
+    );
+    await expect(
+      service.recordPrintResult({
+        runId: 'stale',
+        outcome: 'printed-correctly',
+        note: '',
+      }),
+    ).rejects.toThrow();
+    await expect(
+      service.recordPrintResult({
+        runId: run.id,
+        outcome: 'invented',
+        note: '',
+      }),
+    ).rejects.toThrow();
+    await expect(
+      service.recordPrintResult({
+        runId: run.id,
+        outcome: 'printed-correctly',
+        note: 'x'.repeat(1001),
+      }),
+    ).rejects.toThrow();
+    await service.recordPrintResult({
+      runId: run.id,
+      outcome: 'printed-correctly',
+      note: 'TEST APPLE, 12.34/kg; label checked',
+    });
+    const saved = JSON.parse(
+      await readFile(join(run.reportDirectory, 'report.json'), 'utf8'),
+    );
+    expect(saved.printObservation.source).toBe('operator');
+    expect(saved.printObservation.outcome).toBe('printed-correctly');
+    expect(
+      saved.steps.find((s: { id: string }) => s.id === 'print-test').status,
+    ).toBe('passed');
+    const text = await readFile(
+      join(run.reportDirectory, 'report.txt'),
+      'utf8',
+    );
+    expect(text).toContain('write-acknowledged');
+    expect(text).not.toContain('команды PLU не отправлялись');
+    expect(text).toContain('TEST APPLE, 12.34/kg');
+    service.rerun();
+    await finished();
+    expect(transferTestProduct).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks device writes when the report cannot be saved', async () => {
+    await service.initialize();
+    await finished();
+    await service.saveProfile({
+      scaleIp: '192.168.50.10',
+      localAddress: '192.168.50.2',
+      port: 5001,
+    });
+    await finished();
+    const blockedPath = join(directory, 'blocked-logs');
+    await writeFile(blockedPath, 'not a directory');
+    service = new DiagnosticsService({
+      dataDirectory: join(directory, 'data'),
+      logsDirectory: blockedPath,
+      appVersion: '0.1.1',
+    });
+    await service.initialize();
+    await finished();
+    service.startTransferTest({ priceDecimals: 2 });
+    await finished();
+    const run = service.getState().run!;
+    expect(run.persistenceError).toBeTruthy();
+    expect(
+      run.steps.find((step) => step.id === 'device-transfer')?.status,
+    ).toBe('failed');
+    expect(transferTestProduct).not.toHaveBeenCalled();
+  });
+
+  it('does not mark an uncertain transfer or its printing as successful', async () => {
+    await service.initialize();
+    await finished();
+    await service.saveProfile({
+      scaleIp: '192.168.50.10',
+      localAddress: '192.168.50.2',
+      port: 5001,
+    });
+    await finished();
+    vi.mocked(transferTestProduct).mockResolvedValueOnce({
+      status: 'warning',
+      summary: 'Write sent; ACK lost',
+    });
+    service.startTransferTest({ priceDecimals: 2 });
+    await finished();
+    const run = service.getState().run!;
+    expect(run.protocolStatus).toBe('unverified');
+    await expect(
+      service.recordPrintResult({
+        runId: run.id,
+        outcome: 'printed-correctly',
+        note: '',
+      }),
+    ).rejects.toThrow();
+  });
+
   it('retains a saved profile while its adapter is unavailable and uses it after reconnection', async () => {
     await service.initialize();
     await finished();
