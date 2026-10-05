@@ -101,6 +101,8 @@ export function parseCapabilities(packet: Buffer): {
   pluType: 'unlimited';
   family: 'LP' | 'LS';
   headerHex: string;
+  responseBytes: 259 | 261;
+  checksumStatus: 'not-provided' | 'verified';
   flags: {
     payload0: number;
     payload7: number;
@@ -111,11 +113,18 @@ export function parseCapabilities(packet: Buffer): {
     payload24: number;
   };
 } {
-  // VA 6D49CD copies a raw 261-byte UDP reply; 6D4729 extracts its payload.
-  if (packet.length !== 261)
-    throw new Error('Capabilities must contain 261 bytes');
-  if (packet.readUInt16LE(259) !== checksum(packet))
+  // The 2026-10-05 hardware capture contains 259 bytes: header + payload only.
+  // VA 6D53F4 retains the actual receive length; 6D49CD copies an internal
+  // 261-byte buffer, while 6D4729 extracts only its 256-byte payload at offset 3.
+  if (packet.length !== 259 && packet.length !== 261)
+    throw new Error('Capabilities must contain 259 or 261 bytes');
+  if (packet.length === 259) {
+    // Restrict the checksum-free variant to the observed capabilities header.
+    if (packet[0] !== 0x0e || packet[1] !== 3 || packet[2] !== 0)
+      throw new Error('Unknown checksum-free capabilities header');
+  } else if (packet.readUInt16LE(259) !== checksum(packet)) {
     throw new Error('Capabilities checksum mismatch');
+  }
   const payload = packet.subarray(3, 259);
   // VA 7A78CE..7A78F3: LB1.00 selects PLU Type "No Limit"; older limits stop here.
   if (!payload.subarray(1, 7).equals(Buffer.from('LB1.00', 'ascii')))
@@ -130,8 +139,9 @@ export function parseCapabilities(packet: Buffer): {
     fingerprint: 'LB1.00',
     pluType: 'unlimited',
     family: payload[8] === 0x50 ? 'LP' : 'LS', // VA 7A78FC..7A7920.
-    // No response-header echo check was found in the vendor UDP path.
     headerHex: packet.subarray(0, 3).toString('hex'),
+    responseBytes: packet.length,
+    checksumStatus: packet.length === 259 ? 'not-provided' : 'verified',
     flags: {
       payload0: payload[0],
       payload7: payload[7],

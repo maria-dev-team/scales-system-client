@@ -13,6 +13,11 @@ import {
   sessionIdBytes,
 } from './transfer-codec';
 
+// Exact capabilities datagram captured from RLS1100 on 2026-10-05.
+// It has a 3-byte header and 256-byte payload, with no application checksum.
+const capturedCapabilitiesHex =
+  '0e0300aa4c42312e3030aa02ab2af800010000200120210105000000000000007b57656920533d3030302e303030307d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000';
+
 const sockets: Socket[] = [];
 afterEach(async () => {
   await Promise.all(
@@ -62,6 +67,37 @@ async function device(
 }
 
 describe('vendor update encoding', () => {
+  it('decodes the captured 259-byte RLS1100 reply without claiming a checksum check', () => {
+    const packet = Buffer.from(capturedCapabilitiesHex, 'hex');
+    expect(packet).toHaveLength(259);
+    expect(parseCapabilities(packet)).toMatchObject({
+      fingerprint: 'LB1.00',
+      nameBytes: 36,
+      family: 'LS',
+      responseBytes: 259,
+      checksumStatus: 'not-provided',
+      headerHex: '0e0300',
+    });
+  });
+  it.each([258, 260, 262])(
+    'rejects malformed capability length %i',
+    (length) => {
+      const packet = Buffer.alloc(length);
+      Buffer.from(capturedCapabilitiesHex, 'hex').copy(packet);
+      expect(() => parseCapabilities(packet)).toThrow(/bytes/);
+    },
+  );
+  it('requires the observed header, known fingerprint and supported width for a checksum-free reply', () => {
+    const header = Buffer.from(capturedCapabilitiesHex, 'hex');
+    header[1] = 2;
+    expect(() => parseCapabilities(header)).toThrow(/header/);
+    const fingerprint = Buffer.from(capturedCapabilitiesHex, 'hex');
+    fingerprint[4] = 0;
+    expect(() => parseCapabilities(fingerprint)).toThrow(/LB1.00/);
+    const width = Buffer.from(capturedCapabilitiesHex, 'hex');
+    width[28] = 30;
+    expect(() => parseCapabilities(width)).toThrow(/36/);
+  });
   it('reproduces signed IDIV session IDs, including negative IPv4 integers', () => {
     expect(sessionIdBytes('192.168.1.87').toString('hex')).toBe('cdec8d9e');
     expect(sessionIdBytes('192.168.1.8').toString('hex')).toBe('eeeb8d9e');
@@ -96,7 +132,11 @@ describe('vendor update encoding', () => {
     expect(() => encodeTestProduct(4 as 2)).toThrow();
   });
   it('accepts only intact known capability layouts and stops on incompatible name length', () => {
-    expect(parseCapabilities(capabilityReply()).nameBytes).toBe(36);
+    expect(parseCapabilities(capabilityReply())).toMatchObject({
+      nameBytes: 36,
+      responseBytes: 261,
+      checksumStatus: 'verified',
+    });
     const corrupted = capabilityReply();
     corrupted[50] ^= 1;
     expect(() => parseCapabilities(corrupted)).toThrow(/checksum/);
@@ -112,52 +152,61 @@ describe('vendor update encoding', () => {
 });
 
 describe('UDP test transfer against a local fake device', () => {
-  it('persists every planned send before sending, requires four phase replies and uses one local port', async () => {
-    const planned: string[] = [];
-    const received: string[] = [];
-    const ports: number[] = [];
-    const snapshots: CheckResult[] = [];
-    const profile = await device((message, peer, socket) => {
-      const hex = message.toString('hex');
-      expect(planned).toContain(hex);
-      received.push(hex);
-      ports.push(peer.port);
-      socket.send(
-        message[0] === 14 && message[1] === 3
-          ? capabilityReply()
-          : Buffer.from([2]),
-        peer.port,
-        peer.address,
+  it.each([
+    { format: '261-byte checksummed', reply: capabilityReply() },
+    {
+      format: '259-byte captured',
+      reply: Buffer.from(capturedCapabilitiesHex, 'hex'),
+    },
+  ])(
+    'completes four phases with $format capabilities and persists every send',
+    async ({ reply }) => {
+      const planned: string[] = [];
+      const received: string[] = [];
+      const ports: number[] = [];
+      const snapshots: CheckResult[] = [];
+      const profile = await device((message, peer, socket) => {
+        const hex = message.toString('hex');
+        expect(planned).toContain(hex);
+        received.push(hex);
+        ports.push(peer.port);
+        socket.send(
+          message[0] === 14 && message[1] === 3 ? reply : Buffer.from([2]),
+          peer.port,
+          peer.address,
+        );
+      });
+      const result = await transferTestProduct(
+        profile,
+        { priceDecimals: 2 },
+        new AbortController().signal,
+        async (state) => {
+          snapshots.push(state);
+          const details = state.details as {
+            events: { kind: string; hex?: string }[];
+          };
+          for (const event of details.events)
+            if (event.kind === 'tx-planned' && event.hex)
+              planned.push(event.hex);
+        },
       );
-    });
-    const result = await transferTestProduct(
-      profile,
-      { priceDecimals: 2 },
-      new AbortController().signal,
-      async (state) => {
-        snapshots.push(state);
-        const details = state.details as {
-          events: { kind: string; hex?: string }[];
-        };
-        for (const event of details.events)
-          if (event.kind === 'tx-planned' && event.hex) planned.push(event.hex);
-      },
-    );
-    expect(result.status).toBe('passed');
-    expect(received.map((hex) => hex.slice(0, 6))).toEqual([
-      '0e0100',
-      '0e0300',
-      '0b0000',
-      '0e0200',
-    ]);
-    expect(new Set(ports).size).toBe(1);
-    expect(result.details).toMatchObject({
-      writeOutcome: 'acknowledged',
-      sessionClosed: true,
-      protocolVerified: false,
-    });
-    expect(snapshots.length).toBeGreaterThan(8);
-  });
+      expect(result.status).toBe('passed');
+      expect(received.map((hex) => hex.slice(0, 6))).toEqual([
+        '0e0100',
+        '0e0300',
+        '0b0000',
+        '0e0200',
+      ]);
+      expect(new Set(ports).size).toBe(1);
+      expect(result.details).toMatchObject({
+        writeOutcome: 'acknowledged',
+        sessionClosed: true,
+        protocolVerified: false,
+        capabilities: { responseBytes: reply.length },
+      });
+      expect(snapshots.length).toBeGreaterThan(8);
+    },
+  );
   it.each([Buffer.from([0x55]), Buffer.from([2, 0]), Buffer.from([0x99])])(
     'does not send a product after invalid handshake %s',
     async (reply) => {
