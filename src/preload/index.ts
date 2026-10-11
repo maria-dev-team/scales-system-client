@@ -1,18 +1,25 @@
 import { contextBridge, ipcRenderer } from 'electron';
 
-import type { DiagnosticsApi } from '../shared/diagnostics';
+import type { CatalogApi } from '../shared/catalog';
 
-const diagnostics: DiagnosticsApi = {
-  getState: () => ipcRenderer.invoke('diagnostics:get-state'),
-  saveProfile: (profile) =>
-    ipcRenderer.invoke('diagnostics:save-profile', profile),
-  rerun: () => ipcRenderer.invoke('diagnostics:rerun'),
-  cancel: () => ipcRenderer.invoke('diagnostics:cancel'),
-  exportReport: () => ipcRenderer.invoke('diagnostics:export'),
-  startTransferTest: (options) =>
-    ipcRenderer.invoke('diagnostics:transfer-test', options),
-  recordPrintResult: (input) =>
-    ipcRenderer.invoke('diagnostics:print-result', input),
+const catalog: CatalogApi = {
+  request: (request) => ipcRenderer.invoke('catalog:request', request),
+  onChange: (listener) => {
+    const handler = (): void => listener();
+    ipcRenderer.on('catalog:changed', handler);
+    return () => ipcRenderer.removeListener('catalog:changed', handler);
+  },
+  onRefreshRequired: (listener) => {
+    const handler = (): void => listener();
+    ipcRenderer.on('catalog:refresh-required', handler);
+    return () =>
+      ipcRenderer.removeListener('catalog:refresh-required', handler);
+  },
 };
+contextBridge.exposeInMainWorld('catalog', catalog);
 
-contextBridge.exposeInMainWorld('diagnostics', diagnostics);
+contextBridge.exposeInMainWorld('windowControls', {
+  minimize: (): void => {
+    ipcRenderer.send('window-controls:minimize');
+  },
+});

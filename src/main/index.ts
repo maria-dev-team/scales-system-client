@@ -3,11 +3,13 @@ import { BrowserWindow, app, net, protocol } from 'electron';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
 
-import { registerDiagnosticsIpc } from './diagnostics/ipc';
-import { DiagnosticsService } from './diagnostics/service';
+import { registerCatalogIpc } from './catalog/ipc';
+import { CatalogService } from './catalog/service';
 import { resolveRendererFilePath } from './renderer-protocol';
+import { registerWindowControlsIpc } from './window-controls';
 
-let diagnostics: DiagnosticsService | null = null;
+let catalog: CatalogService | null = null;
+let quitting = false;
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -38,6 +40,10 @@ function createWindow(): void {
     },
   });
 
+  registerWindowControlsIpc(
+    window,
+    is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined,
+  );
   window.on('ready-to-show', () => window.show());
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.session.setPermissionRequestHandler(
@@ -65,19 +71,18 @@ if (!app.requestSingleInstanceLock()) {
     window?.focus();
   });
 
-  void app.whenReady().then(async () => {
+  void app.whenReady().then(() => {
     electronApp.setAppUserModelId('kz.maria.scales');
     app.setAppLogsPath();
-    diagnostics = new DiagnosticsService({
+    catalog = new CatalogService({
       dataDirectory: app.getPath('userData'),
-      logsDirectory: app.getPath('logs'),
-      appVersion: app.getVersion(),
+      apiUrl: process.env.SCALES_API_URL ?? '',
     });
-    await diagnostics.initialize();
-    registerDiagnosticsIpc(
-      diagnostics,
+    registerCatalogIpc(
+      catalog,
       is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined,
     );
+    void catalog.initialize().catch(() => undefined);
     const rendererRoot = join(__dirname, '../renderer');
     protocol.handle('maria', (request) => {
       const filePath = resolveRendererFilePath(rendererRoot, request.url);
@@ -100,7 +105,8 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', (event) => {
-  if (!diagnostics?.isRunning()) return;
+  if (quitting) return;
   event.preventDefault();
-  void diagnostics.cancel().finally(() => app.quit());
+  quitting = true;
+  void Promise.allSettled([catalog?.close()]).finally(() => app.quit());
 });

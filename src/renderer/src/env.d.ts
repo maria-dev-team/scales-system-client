@@ -1,8 +1,9 @@
 /// <reference types="vite/client" />
-import type { DiagnosticsApi } from '../../shared/diagnostics';
+import type { CatalogApi } from '../../shared/catalog';
 
 declare global {
   interface Window {
-    diagnostics?: DiagnosticsApi;
+    catalog?: CatalogApi;
+    windowControls?: { minimize: () => void };
   }
 }
