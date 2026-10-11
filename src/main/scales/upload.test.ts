@@ -27,6 +27,7 @@ function capabilities(): Buffer {
   const packet = Buffer.alloc(259);
   packet.set([0x0e, 3, 0]);
   packet.write('LB1.00', 4, 'ascii');
+  packet[11] = 0x02;
   return packet;
 }
 

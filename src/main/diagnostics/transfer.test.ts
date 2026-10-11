@@ -98,6 +98,41 @@ describe('vendor update encoding', () => {
     width[28] = 30;
     expect(() => parseCapabilities(width)).toThrow(/36/);
   });
+  it.each([259, 261])(
+    'accepts the known LS and LP family bytes in a %i-byte reply',
+    (length) => {
+      for (const [byte, family] of [
+        [0x02, 'LS'],
+        [0x50, 'LP'],
+      ] as const) {
+        const packet = capabilityReply();
+        packet[11] = byte;
+        packet.writeUInt16LE(
+          packet.subarray(0, 259).reduce((sum, value) => sum + value, 0),
+          259,
+        );
+        expect(parseCapabilities(packet.subarray(0, length)).family).toBe(
+          family,
+        );
+      }
+    },
+  );
+  it.each([259, 261])(
+    'rejects unknown family bytes in a %i-byte reply',
+    (length) => {
+      for (const byte of [0x00, 0x51, 0xff]) {
+        const packet = capabilityReply();
+        packet[11] = byte;
+        packet.writeUInt16LE(
+          packet.subarray(0, 259).reduce((sum, value) => sum + value, 0),
+          259,
+        );
+        expect(() => parseCapabilities(packet.subarray(0, length))).toThrow(
+          /family/,
+        );
+      }
+    },
+  );
   it('reproduces signed IDIV session IDs, including negative IPv4 integers', () => {
     expect(sessionIdBytes('192.168.1.87').toString('hex')).toBe('cdec8d9e');
     expect(sessionIdBytes('192.168.1.8').toString('hex')).toBe('eeeb8d9e');

@@ -159,7 +159,15 @@ describe('PLU-only range clear', () => {
     expect(snapshots[0].events).toHaveLength(1);
   });
 
-  it.each(['fingerprint', 'family', 'name', 'header', 'checksum'] as const)(
+  it.each([
+    'fingerprint',
+    'family',
+    'unknown-family',
+    'unknown-family-checksummed',
+    'name',
+    'header',
+    'checksum',
+  ] as const)(
     'blocks clears for unsupported %s capabilities',
     async (invalid) => {
       const scale = await fakeScale((packet, peer, socket) => {
@@ -167,8 +175,13 @@ describe('PLU-only range clear', () => {
         let response = capabilities();
         if (invalid === 'fingerprint') response.write('LB2.00', 4, 'ascii');
         if (invalid === 'family') response[11] = 0x50;
+        if (invalid.startsWith('unknown-family')) response[11] = 0x51;
         if (invalid === 'name') response[28] = 48;
-        if (invalid === 'header' || invalid === 'checksum') {
+        if (
+          invalid === 'header' ||
+          invalid === 'checksum' ||
+          invalid === 'unknown-family-checksummed'
+        ) {
           response = Buffer.concat([response, Buffer.alloc(2)]);
           if (invalid === 'header') response[1] = 4;
           response.writeUInt16LE(

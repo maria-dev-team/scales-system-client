@@ -134,11 +134,17 @@ export function parseCapabilities(packet: Buffer): {
   // VA 7A780E and 7A7B28: zero retains the default 36, positive overrides it.
   if (payload[25] !== 0 && payload[25] !== 36)
     throw new Error('Only the 36-byte PLU name layout is supported');
+  // VA 7A78FC..7A7920 identifies LP as 0x50; accept LS only as captured.
+  // The vendor's catch-all LS classification is unsafe for destructive clears.
+  if (payload[8] !== 0x02 && payload[8] !== 0x50)
+    throw new Error(
+      'Unknown capabilities family: expected LS (0x02) or LP (0x50)',
+    );
   return {
     nameBytes: 36,
     fingerprint: 'LB1.00',
     pluType: 'unlimited',
-    family: payload[8] === 0x50 ? 'LP' : 'LS', // VA 7A78FC..7A7920.
+    family: payload[8] === 0x50 ? 'LP' : 'LS',
     headerHex: packet.subarray(0, 3).toString('hex'),
     responseBytes: packet.length,
     checksumStatus: packet.length === 259 ? 'not-provided' : 'verified',
