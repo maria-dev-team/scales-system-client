@@ -1,7 +1,9 @@
 import { LoaderCircle } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
+import type { CatalogState } from '../../shared/catalog';
 import { Button } from './common/components/ui/button';
+import { decodeAccessToken } from './common/helpers/access-token';
 import { getHttpErrorMessage } from './common/helpers/http-error.helper';
 import {
   AuthShell,
@@ -9,6 +11,7 @@ import {
   SignedInView,
   useAuthStore,
 } from './features/auth';
+import { CatalogView } from './features/catalog';
 
 export default function App() {
   const accessToken = useAuthStore((state) => state.accessToken);
@@ -16,6 +19,27 @@ export default function App() {
   const isInitialized = useAuthStore((state) => state.isInitialized);
   const [initializationError, setInitializationError] = useState<unknown>(null);
   const [attempt, setAttempt] = useState(0);
+  const [localState, setLocalState] = useState<CatalogState | null>(null);
+
+  useEffect(() => {
+    const api = window.catalog;
+    if (!api) return;
+    let active = true;
+    const update = (): void => {
+      void api
+        .request({ type: 'state' })
+        .then((state) => {
+          if (active) setLocalState(state);
+        })
+        .catch(() => undefined);
+    };
+    update();
+    const unsubscribe = api.onChange(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     if (isInitialized) return;
@@ -27,6 +51,40 @@ export default function App() {
       active = false;
     };
   }, [attempt, initialize, isInitialized]);
+
+  const cachedScope = localState?.scope;
+  const claims = decodeAccessToken(accessToken);
+  const tokenMatchesCachedScope =
+    cachedScope &&
+    claims?.sub === cachedScope.userId &&
+    claims?.userOrganizationId === cachedScope.membershipId &&
+    claims?.organizationId === cachedScope.organizationId &&
+    claims?.storeId === cachedScope.storeId;
+
+  if (
+    (!accessToken || tokenMatchesCachedScope) &&
+    cachedScope &&
+    localState.access === 'offline'
+  ) {
+    return (
+      <CatalogView
+        storeName={cachedScope.storeName}
+        footer={
+          <Button
+            variant="ghost"
+            onClick={() => {
+              void window.catalog?.request({ type: 'disconnect' }).then(() => {
+                setLocalState(null);
+                useAuthStore.getState().clearAccessToken();
+              });
+            }}
+          >
+            Выйти из локального каталога
+          </Button>
+        }
+      />
+    );
+  }
 
   if (!isInitialized) {
     return (

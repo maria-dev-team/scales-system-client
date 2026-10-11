@@ -3,7 +3,13 @@ import { BrowserWindow, app, net, protocol } from 'electron';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
 
+import { registerCatalogIpc } from './catalog/ipc';
+import { CatalogService } from './catalog/service';
 import { resolveRendererFilePath } from './renderer-protocol';
+import { registerWindowControlsIpc } from './window-controls';
+
+let catalog: CatalogService | null = null;
+let quitting = false;
 
 protocol.registerSchemesAsPrivileged([
   {
@@ -34,6 +40,10 @@ function createWindow(): void {
     },
   });
 
+  registerWindowControlsIpc(
+    window,
+    is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined,
+  );
   window.on('ready-to-show', () => window.show());
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.session.setPermissionRequestHandler(
@@ -63,6 +73,16 @@ if (!app.requestSingleInstanceLock()) {
 
   void app.whenReady().then(() => {
     electronApp.setAppUserModelId('kz.maria.scales');
+    app.setAppLogsPath();
+    catalog = new CatalogService({
+      dataDirectory: app.getPath('userData'),
+      apiUrl: process.env.SCALES_API_URL ?? '',
+    });
+    registerCatalogIpc(
+      catalog,
+      is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined,
+    );
+    void catalog.initialize().catch(() => undefined);
     const rendererRoot = join(__dirname, '../renderer');
     protocol.handle('maria', (request) => {
       const filePath = resolveRendererFilePath(rendererRoot, request.url);
@@ -82,4 +102,11 @@ if (!app.requestSingleInstanceLock()) {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', (event) => {
+  if (quitting) return;
+  event.preventDefault();
+  quitting = true;
+  void Promise.allSettled([catalog?.close()]).finally(() => app.quit());
 });

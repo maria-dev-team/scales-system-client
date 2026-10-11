@@ -2,15 +2,21 @@ import type { ComponentProps } from 'react';
 
 import { cn } from '@renderer/common/lib/utils';
 
+import { Spinner } from './spinner';
+
 type ButtonProps = ComponentProps<'button'> & {
   size?: 'default' | 'icon';
   variant?: 'default' | 'ghost';
+  loading?: boolean;
 };
 
 export function Button({
   className,
   size = 'default',
   variant = 'default',
+  loading = false,
+  disabled,
+  children,
   ...props
 }: ButtonProps) {
   return (
@@ -24,7 +30,12 @@ export function Button({
         className,
       )}
       data-slot="button"
+      disabled={disabled || loading}
+      aria-busy={loading || undefined}
       {...props}
-    />
+    >
+      {loading ? <Spinner /> : null}
+      {children}
+    </button>
   );
 }
