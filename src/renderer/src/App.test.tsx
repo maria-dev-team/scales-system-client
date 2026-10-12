@@ -13,6 +13,7 @@ import {
 import App from './App';
 import { configureAccessTokenProvider } from './common/api';
 import { request } from './common/api/request';
+import { CatalogAuthBridge } from './common/lib/catalog-session';
 import { createQueryClient } from './common/lib/query-client';
 import { authTokenProvider, useAuthStore } from './features/auth';
 import {
@@ -83,6 +84,7 @@ afterEach(() => {
 const renderApp = () =>
   render(
     <QueryClientProvider client={queryClient}>
+      <CatalogAuthBridge />
       <App />
     </QueryClientProvider>,
   );

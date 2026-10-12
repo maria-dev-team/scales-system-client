@@ -18,6 +18,7 @@ const harness = vi.hoisted(() => ({
   >(),
   worker: null as EventEmitter | null,
   sent: [] as Array<{ id: number; request?: { type: string } }>,
+  rendererSend: vi.fn(),
   trusted: {} as object,
   exportDirectory: null as string | null,
 }));
@@ -31,7 +32,12 @@ vi.mock('electron', () => ({
   BrowserWindow: {
     fromWebContents: (sender: object) =>
       sender === harness.trusted ? {} : null,
-    getAllWindows: () => [],
+    getAllWindows: () => [
+      {
+        isDestroyed: () => false,
+        webContents: { send: harness.rendererSend },
+      },
+    ],
   },
   dialog: {
     showOpenDialog: async () => ({
@@ -89,6 +95,7 @@ const event = (url = 'maria://app/'): IpcMainInvokeEvent => {
 beforeEach(() => {
   harness.handlers.clear();
   harness.sent.length = 0;
+  harness.rendererSend.mockReset();
   harness.worker = null;
   harness.exportDirectory = null;
 });
@@ -280,6 +287,36 @@ it('releases pending calls on worker failure', async () => {
   harness.worker!.emit('error', new Error('worker crashed'));
   await expect(request).rejects.toThrow();
   expect((await service.request({ type: 'state' })).error).toBeTruthy();
+});
+
+it('stops renderer notifications as soon as shutdown starts while settling pending calls', async () => {
+  const service = await setup();
+  const worker = harness.worker!;
+  worker.emit('message', { type: 'ready' });
+  worker.emit('message', { type: 'changed', uploading: false });
+  worker.emit('message', { type: 'refresh-required' });
+  expect(harness.rendererSend.mock.calls).toEqual([
+    ['catalog:changed'],
+    ['catalog:changed'],
+    ['catalog:refresh-required'],
+  ]);
+  harness.rendererSend.mockClear();
+
+  const request = service.request({ type: 'connect', accessToken: 'secret' });
+  const rejected = expect(request).rejects.toThrow();
+  await turn();
+
+  const closing = service.close();
+  worker.emit('message', { type: 'changed', uploading: false });
+  worker.emit('message', { type: 'refresh-required' });
+  worker.emit('message', { type: 'ready' });
+  await closing;
+  await rejected;
+
+  await expect(service.request({ type: 'state' })).rejects.toThrow(
+    'Приложение завершает работу.',
+  );
+  expect(harness.rendererSend).not.toHaveBeenCalled();
 });
 
 it('surfaces local initialization failure through catalog state', async () => {

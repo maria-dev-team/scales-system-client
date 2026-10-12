@@ -1,11 +1,10 @@
-import { ArrowRight, Computer } from 'lucide-react';
+import { ArrowRight, CircleCheck, Computer } from 'lucide-react';
 import { type ReactNode, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
 
 import { Button } from '@renderer/common/components/ui/button';
 import { Input } from '@renderer/common/components/ui/input';
 import { Spinner } from '@renderer/common/components/ui/spinner';
-import { useCatalogSession } from '@renderer/common/lib/catalog-session';
 
 import {
   type CatalogPage,
@@ -17,6 +16,7 @@ import type { NetworkAdapter } from '../../../../shared/diagnostics';
 import { catalogErrorMessage } from './catalog-error';
 import { ClearProducts } from './clear-products';
 import { DeviceForm } from './device-form';
+import { useCatalogRefresh } from './use-catalog-refresh';
 import {
   isDeviceOperationRunning,
   useDeviceOperationToasts,
@@ -46,7 +46,6 @@ export function CatalogView({
   footer,
   disabled = false,
 }: CatalogViewProps) {
-  useCatalogSession();
   const api = window.catalog;
   const [section, setSection] = useState<WorkspaceSection>('home');
   const [deviceOpened, setDeviceOpened] = useState(false);
@@ -67,6 +66,7 @@ export function CatalogView({
     previousSection.current = section;
   }, [section]);
   const [state, setState] = useState<CatalogState>(emptyCatalogState);
+  const catalogRefresh = useCatalogRefresh(state, setState);
   useDeviceOperationToasts(state);
   const [page, setPage] = useState<CatalogPage>({ products: [], total: 0 });
   const [adapters, setAdapters] = useState<NetworkAdapter[]>([]);
@@ -271,7 +271,7 @@ export function CatalogView({
         </p>
       ) : (
         <>
-          {[error, state.error, state.sync.error]
+          {[error, catalogRefresh.error, state.error, state.sync.error]
             .filter(
               (value, index, list) => value && list.indexOf(value) === index,
             )
@@ -469,21 +469,19 @@ export function CatalogView({
                           Товары из Maria: {state.total}
                         </h2>
                         <p className="mt-1 text-sm text-muted-foreground">
-                          Последняя полная синхронизация:{' '}
+                          Последняя успешная проверка:{' '}
                           {dateLabel(state.sync.lastSyncedAt)}
                         </p>
                       </div>
                       <div className="flex gap-2">
                         <Button
-                          disabled={locked || syncing}
-                          loading={syncing || pending === 'Обновляем каталог…'}
-                          onClick={() =>
-                            void run(
-                              async () =>
-                                setState(await api.request({ type: 'sync' })),
-                              'Обновляем каталог…',
-                            )
-                          }
+                          disabled={locked || syncing || catalogRefresh.pending}
+                          loading={syncing || catalogRefresh.pending}
+                          onClick={() => {
+                            setError(null);
+                            setNotice(null);
+                            void catalogRefresh.refresh();
+                          }}
                         >
                           Обновить каталог
                         </Button>
@@ -505,6 +503,27 @@ export function CatalogView({
                         </Button>
                       </div>
                     </div>
+                    {catalogRefresh.completed &&
+                    !syncing &&
+                    state.access === 'online' &&
+                    state.sync.phase === 'idle' ? (
+                      <div
+                        role="status"
+                        className="flex items-start gap-3 rounded-lg border border-emerald-600/25 bg-emerald-500/10 p-4 text-emerald-800 dark:text-emerald-300"
+                      >
+                        <CircleCheck
+                          aria-hidden="true"
+                          className="mt-0.5 size-5 shrink-0"
+                        />
+                        <div>
+                          <p className="font-semibold">Каталог актуален</p>
+                          <p className="mt-1 text-sm">
+                            Проверено: {dateLabel(state.sync.lastSyncedAt)}. В
+                            локальной базе: {state.total} товаров.
+                          </p>
+                        </div>
+                      </div>
+                    ) : null}
                     {syncing ? (
                       <p role="status" className="text-sm">
                         {state.sync.phase === 'pages'

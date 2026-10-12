@@ -88,6 +88,7 @@ export class CatalogService {
     worker.on('message', (message: WorkerMessage) => this.receive(message));
   }
   private notify(channel: string): void {
+    if (this.closed) return;
     for (const window of BrowserWindow.getAllWindows()) {
       if (!window.isDestroyed()) window.webContents.send(channel);
     }

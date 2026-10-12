@@ -1,5 +1,6 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { toast } from 'sonner';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -11,10 +12,6 @@ import {
   emptyCatalogState,
 } from '../../../../shared/catalog';
 import { CatalogView } from './catalog-view';
-
-vi.mock('@renderer/common/lib/catalog-session', () => ({
-  useCatalogSession: () => undefined,
-}));
 
 const product: CatalogProduct = {
   id: 'apple',
@@ -32,8 +29,11 @@ const product: CatalogProduct = {
 let state: CatalogState;
 let preview: UploadPreview;
 let saveError: Error | null;
+let syncRequest: () => Promise<CatalogState>;
+const listeners = new Set<() => void>();
 const request = vi.fn(async (input: CatalogRequest): Promise<unknown> => {
   if (input.type === 'state') return state;
+  if (input.type === 'sync') return syncRequest();
   if (input.type === 'list')
     return { products: [{ ...product, issues: [] }], total: 1 };
   if (input.type === 'adapters')
@@ -60,6 +60,8 @@ const request = vi.fn(async (input: CatalogRequest): Promise<unknown> => {
 });
 
 beforeEach(() => {
+  listeners.clear();
+  syncRequest = async () => state;
   request.mockClear();
   saveError = null;
   state = {
@@ -108,7 +110,10 @@ beforeEach(() => {
     configurable: true,
     value: {
       request: request as CatalogApi['request'],
-      onChange: () => () => {},
+      onChange: (listener: () => void) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
       onRefreshRequired: () => () => {},
     },
   });
@@ -600,5 +605,170 @@ describe('weighted catalog', () => {
         name: /Проверил весы после неподтверждённой отправки/,
       }),
     ).toBeVisible();
+  });
+});
+
+const emitState = async () =>
+  act(async () => {
+    listeners.forEach((listener) => listener());
+  });
+
+describe('manual catalog refresh feedback', () => {
+  beforeEach(() => {
+    vi.spyOn(toast, 'loading').mockReturnValue('catalog-refresh');
+    vi.spyOn(toast, 'success').mockReturnValue('catalog-refresh');
+    vi.spyOn(toast, 'error').mockReturnValue('catalog-refresh');
+    vi.spyOn(toast, 'warning').mockReturnValue('catalog-refresh');
+    vi.spyOn(toast, 'dismiss').mockReturnValue('catalog-refresh');
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('keeps progress after the start ACK, prevents repeat clicks and confirms the actual finish once', async () => {
+    syncRequest = async () =>
+      (state = {
+        ...state,
+        sync: { ...state.sync, running: true, phase: 'changes' },
+      });
+    mount();
+    await openCatalog();
+    const button = screen.getByRole('button', { name: 'Обновить каталог' });
+    await userEvent.click(button);
+    expect(button).toBeDisabled();
+    expect(toast.dismiss).not.toHaveBeenCalled();
+    expect(toast.success).not.toHaveBeenCalled();
+    await userEvent.click(button);
+    expect(
+      request.mock.calls.filter(([input]) => input.type === 'sync'),
+    ).toHaveLength(1);
+    // A state read started before the click may arrive after the start ACK.
+    state = {
+      ...state,
+      sync: { ...state.sync, running: false, phase: 'idle' },
+    };
+    await emitState();
+    expect(button).toBeDisabled();
+    expect(toast.warning).not.toHaveBeenCalled();
+    state = {
+      ...state,
+      sync: {
+        ...state.sync,
+        running: false,
+        phase: 'idle',
+        lastSyncedAt: '2026-10-12T15:00:00Z',
+      },
+    };
+    await emitState();
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith(
+        'Каталог актуален',
+        expect.objectContaining({ id: 'catalog-refresh', duration: 6000 }),
+      ),
+    );
+    expect(
+      within(
+        screen.getByRole('region', { name: 'Синхронизация каталога' }),
+      ).getByText('Каталог актуален'),
+    ).toBeVisible();
+    expect(button).toBeEnabled();
+    await emitState();
+    expect(toast.success).toHaveBeenCalledTimes(1);
+  });
+
+  it('confirms a fast refresh with unchanged product count even when no running state was observed', async () => {
+    syncRequest = async () =>
+      (state = {
+        ...state,
+        sync: {
+          ...state.sync,
+          running: false,
+          phase: 'idle',
+          lastSyncedAt: '2026-10-12T15:00:00Z',
+        },
+      });
+    mount();
+    await openCatalog();
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Обновить каталог' }),
+    );
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith(
+        'Каталог актуален',
+        expect.objectContaining({
+          duration: 6000,
+          description: expect.stringContaining('1'),
+        }),
+      ),
+    );
+    expect(screen.getByText('Каталог актуален')).toBeVisible();
+  });
+
+  it.each(['error', 'cancelled', 'changes', 'offline'] as const)(
+    'does not report an old snapshot as current after %s',
+    async (outcome) => {
+      syncRequest = async () =>
+        (state = {
+          ...state,
+          access: outcome === 'offline' ? 'offline' : 'online',
+          sync: {
+            ...state.sync,
+            running: false,
+            phase: outcome === 'offline' ? 'idle' : outcome,
+            error: outcome === 'error' ? 'Сервер недоступен' : null,
+          },
+        });
+      mount();
+      await openCatalog();
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Обновить каталог' }),
+      );
+      await waitFor(() =>
+        expect(
+          outcome === 'error' ? toast.error : toast.warning,
+        ).toHaveBeenCalled(),
+      );
+      expect(toast.success).not.toHaveBeenCalled();
+      expect(screen.queryByText('Каталог актуален')).not.toBeInTheDocument();
+      expect(
+        screen.getByRole('button', { name: 'Обновить каталог' }),
+      ).toBeEnabled();
+    },
+  );
+
+  it('reports a rejected refresh command and leaves retry available', async () => {
+    syncRequest = async () => {
+      throw new Error('Нет соединения');
+    };
+    mount();
+    await openCatalog();
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Обновить каталог' }),
+    );
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: 'Обновить каталог' }),
+    ).toBeEnabled();
+  });
+
+  it('dismisses pending feedback on unmount and ignores a late successful response', async () => {
+    let finish!: (next: CatalogState) => void;
+    syncRequest = () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      });
+    const mounted = mount();
+    await openCatalog();
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Обновить каталог' }),
+    );
+    mounted.unmount();
+    expect(toast.dismiss).toHaveBeenCalledWith('catalog-refresh');
+    await act(async () =>
+      finish({
+        ...state,
+        sync: { ...state.sync, lastSyncedAt: '2026-10-12T15:00:00Z' },
+      }),
+    );
+    expect(toast.success).not.toHaveBeenCalled();
   });
 });

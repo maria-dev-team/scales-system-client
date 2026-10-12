@@ -2,11 +2,17 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { AxiosError, type InternalAxiosRequestConfig } from 'axios';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import {
+  type CatalogApi,
+  type CatalogRequest,
+  emptyCatalogState,
+} from '../../../../shared/catalog';
 import App from '../../App';
 import { configureAccessTokenProvider } from '../../common/api';
 import { request } from '../../common/api/request';
+import { CatalogAuthBridge } from '../../common/lib/catalog-session';
 import { createQueryClient } from '../../common/lib/query-client';
 import { authTokenProvider, useAuthStore } from './stores/auth-store';
 
@@ -80,8 +86,24 @@ let organizations: Array<ReturnType<typeof membership>>;
 let selections: Array<{ user_organization_id: string; store_id?: string }>;
 let selectGate: (() => Promise<void>) | undefined;
 let organizationsUnavailable: boolean;
+const catalogRequest = vi.fn(
+  async (input: CatalogRequest): Promise<unknown> => {
+    if (input.type === 'adapters') return [];
+    return emptyCatalogState();
+  },
+);
+const connections = () =>
+  catalogRequest.mock.calls
+    .map(([input]) => input)
+    .filter((input) => input.type === 'connect');
 
 beforeEach(() => {
+  catalogRequest.mockClear();
+  window.catalog = {
+    request: catalogRequest as CatalogApi['request'],
+    onChange: () => () => {},
+    onRefreshRequired: () => () => {},
+  };
   sessionStorage.clear();
   context = contextFor();
   organizations = [...memberships];
@@ -137,6 +159,7 @@ beforeEach(() => {
   };
 });
 afterEach(() => {
+  delete window.catalog;
   queryClient.clear();
   request.defaults.adapter = originalAdapter;
   sessionStorage.clear();
@@ -144,6 +167,7 @@ afterEach(() => {
 const renderApp = () =>
   render(
     <QueryClientProvider client={queryClient}>
+      <CatalogAuthBridge />
       <App />
     </QueryClientProvider>,
   );
@@ -159,6 +183,7 @@ describe('organization and store selection', () => {
     expect(
       await screen.findByRole('heading', { name: 'Выберите магазин' }),
     ).toBeVisible();
+    expect(connections()).toEqual([]);
     await browser.click(
       await screen.findByRole('button', { name: /Восточный/ }),
     );
@@ -174,6 +199,9 @@ describe('organization and store selection', () => {
     expect(useAuthStore.getState().accessToken).toBe(
       tokenFor('member-a', 'store-b'),
     );
+    expect(connections()).toEqual([
+      { type: 'connect', accessToken: tokenFor('member-a', 'store-b') },
+    ]);
   });
 
   it('restores a valid store and allows selecting another store or organization', async () => {
@@ -208,6 +236,10 @@ describe('organization and store selection', () => {
       user_organization_id: 'member-b',
       store_id: 'store-c',
     });
+    expect(connections()).toEqual([
+      { type: 'connect', accessToken: tokenFor('member-a', 'store-a') },
+      { type: 'connect', accessToken: tokenFor('member-b', 'store-c') },
+    ]);
   });
 
   it('still asks for a store after leaving and reopening Maria midway through selection', async () => {

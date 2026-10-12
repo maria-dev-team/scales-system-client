@@ -226,6 +226,143 @@ function setup(
 }
 
 describe('catalog access and upload orchestration', () => {
+  it('automatically syncs the new store after the cancelled old request finishes', async () => {
+    const nextScope = {
+      ...scope,
+      storeId: '00000000-0000-4000-8000-000000000005',
+    };
+    const { engine, db, fetcher } = setup();
+    const original = fetcher.getMockImplementation()!;
+    let releasePage!: () => void;
+    const pendingPage = new Promise<void>((resolve) => {
+      releasePage = resolve;
+    });
+    let oldPageSignal: AbortSignal | null | undefined;
+    let newPermissionChecked = false;
+    fetcher.mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const token = new Headers(init?.headers).get('Authorization');
+      if (token === 'Bearer old-token' && path.endsWith('/page')) {
+        oldPageSignal = init?.signal;
+        await pendingPage;
+      }
+      if (token === 'Bearer new-token' && path.endsWith('/auth/context'))
+        return new Response(
+          JSON.stringify({
+            data: {
+              context: {
+                userOrganizationId: nextScope.membershipId,
+                organizationId: nextScope.organizationId,
+                storeId: nextScope.storeId,
+                storeScope: {
+                  stores: [
+                    { id: nextScope.storeId, name: nextScope.storeName },
+                  ],
+                },
+              },
+            },
+          }),
+        );
+      if (token === 'Bearer new-token' && path.endsWith('/sync-start'))
+        newPermissionChecked = true;
+      return original(input, init);
+    });
+    try {
+      await engine.request({ type: 'connect', accessToken: 'old-token' });
+      await vi.waitFor(() => expect(oldPageSignal).toBeDefined());
+      await engine.request({ type: 'disconnect' });
+      expect(oldPageSignal?.aborted).toBe(true);
+      const connecting = engine.request({
+        type: 'connect',
+        accessToken: 'new-token',
+      });
+      await vi.waitFor(() => expect(newPermissionChecked).toBe(true));
+      releasePage();
+      await connecting;
+      await vi.waitFor(() => expect(engine.state().sync.running).toBe(false));
+      expect(engine.state().scope).toEqual(nextScope);
+      expect(db.getState(nextScope).sync.lastSyncedAt).not.toBeNull();
+      expect(db.getState(scope).sync.lastSyncedAt).toBeNull();
+    } finally {
+      releasePage();
+      await engine.close();
+    }
+  });
+
+  it('shares overlapping verification for the same token without cancelling either caller', async () => {
+    const { engine, persistGrant } = setup();
+    try {
+      await expect(
+        Promise.all([
+          engine.request({ type: 'connect', accessToken: 'token' }),
+          engine.request({ type: 'connect', accessToken: 'token' }),
+        ]),
+      ).resolves.toMatchObject([
+        { access: 'online', scope },
+        { access: 'online', scope },
+      ]);
+      expect(persistGrant).toHaveBeenCalledTimes(1);
+    } finally {
+      await engine.close();
+    }
+  });
+
+  it('still cancels an overlapping verification when the token changes', async () => {
+    const { engine } = setup();
+    try {
+      const results = await Promise.allSettled([
+        engine.request({ type: 'connect', accessToken: 'old-token' }),
+        engine.request({ type: 'connect', accessToken: 'new-token' }),
+      ]);
+      expect(results).toMatchObject([
+        { status: 'rejected' },
+        { status: 'fulfilled', value: { access: 'online', scope } },
+      ]);
+    } finally {
+      await engine.close();
+    }
+  });
+
+  it('starts fresh verification for the same token after a disconnect', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { engine, fetcher } = setup();
+    const respond = fetcher.getMockImplementation()!;
+    fetcher.mockImplementationOnce(async (...args) => {
+      await gate;
+      return respond(...args);
+    });
+    const old = engine.request({ type: 'connect', accessToken: 'token' });
+    const rejected = expect(old).rejects.toThrow();
+    try {
+      await engine.request({ type: 'disconnect' });
+      const fresh = engine.request({ type: 'connect', accessToken: 'token' });
+      release();
+      await rejected;
+      await expect(fresh).resolves.toMatchObject({ access: 'online', scope });
+    } finally {
+      release();
+      await engine.close();
+    }
+  });
+
+  it('retries the same token after verification fails instead of reusing its rejection', async () => {
+    const { engine, fetcher } = setup();
+    fetcher.mockResolvedValueOnce(new Response('{}', { status: 500 }));
+    try {
+      await expect(
+        engine.request({ type: 'connect', accessToken: 'token' }),
+      ).rejects.toThrow('HTTP 500');
+      await expect(
+        engine.request({ type: 'connect', accessToken: 'token' }),
+      ).resolves.toMatchObject({ access: 'online', scope });
+    } finally {
+      await engine.close();
+    }
+  });
+
   it('restores local access without network and revokes it on disconnect', async () => {
     const { engine, fetcher, persistGrant } = setup({
       grant: issueGrant(scope),

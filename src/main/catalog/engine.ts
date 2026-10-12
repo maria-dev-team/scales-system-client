@@ -50,6 +50,11 @@ export class CatalogEngine {
   private refreshRequested = false;
   private readonly connections = new Set<Promise<void>>();
   private connecting: AbortController | null = null;
+  private connectionAttempt: {
+    token: string;
+    epoch: number;
+    task: Promise<void>;
+  } | null = null;
   private syncing: AbortController | null = null;
   private uploading: AbortController | null = null;
   private syncTask: Promise<void> | null = null;
@@ -205,6 +210,10 @@ export class CatalogEngine {
           this.clearTask,
         ]);
       }
+      // A preceding disconnect clears the grant before the aborted sync settles.
+      // Wait here so startSync does not silently skip the newly selected store.
+      if (this.syncing?.signal.aborted)
+        await Promise.allSettled([this.syncTask]);
       controller.signal.throwIfAborted();
       if (epoch !== this.epoch) throw new Error('Учётная запись изменилась.');
       const grant = issueGrant(scope);
@@ -583,12 +592,28 @@ export class CatalogEngine {
       case 'state':
         return this.state();
       case 'connect': {
-        const pending = this.connect(input.accessToken);
+        let attempt = this.connectionAttempt;
+        // React remounts and token refresh can request the same verification
+        // concurrently. Share only an in-flight attempt in the same session.
+        if (
+          !attempt ||
+          attempt.token !== input.accessToken ||
+          attempt.epoch !== this.epoch
+        ) {
+          attempt = {
+            token: input.accessToken,
+            epoch: this.epoch,
+            task: this.connect(input.accessToken),
+          };
+          this.connectionAttempt = attempt;
+        }
+        const pending = attempt.task;
         this.connections.add(pending);
         try {
           await pending;
         } finally {
           this.connections.delete(pending);
+          if (this.connectionAttempt === attempt) this.connectionAttempt = null;
         }
         return this.state();
       }
