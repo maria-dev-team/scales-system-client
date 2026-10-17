@@ -114,6 +114,8 @@ const installOfflineCatalog = () => {
       prefix: '21',
       enabled: true,
       blocked_reason: null,
+      revision: 0,
+      issued_plu_ranges: [[1, 1]],
     },
   };
   const listeners = new Set<() => void>();

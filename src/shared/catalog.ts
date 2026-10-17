@@ -14,6 +14,8 @@ export type ScaleBarcodeProfile = {
   prefix: string | null;
   enabled: boolean;
   blocked_reason: 'barcode_conflict' | null;
+  revision: number;
+  issued_plu_ranges: [number, number][];
 };
 
 export type CatalogProduct = {
@@ -34,6 +36,8 @@ export type ScaleDevice = DiagnosticProfile & {
   nameEncoding: 'ascii' | 'windows-1251';
   barcodePrefix: string;
   setupConfirmed: boolean;
+  profileRevision?: number;
+  reloadRequired?: boolean;
 };
 
 export type UploadItemState =
@@ -59,6 +63,7 @@ export type UploadJob = {
   scope: CatalogScope;
   device: ScaleDevice;
   catalogSyncedAt: string;
+  profileRevision?: number;
   createdAt: string;
   finishedAt: string | null;
   status: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
@@ -92,6 +97,7 @@ export type CatalogSyncState = {
   phase: 'idle' | 'pages' | 'changes' | 'error' | 'cancelled';
   loaded: number;
   lastSyncedAt: string | null;
+  profileRevision?: number;
   error: string | null;
 };
 

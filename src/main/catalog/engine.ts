@@ -23,6 +23,7 @@ import { grantIsValid, issueGrant, parseVerifiedScope } from './access';
 import type { CatalogGrant } from './access';
 import { CatalogApiError, requestCatalogApi } from './api';
 import { CatalogDatabase, scopeKey } from './database';
+import { scaleProfileSchema } from './profile';
 import { CatalogSync } from './sync';
 
 type Options = {
@@ -60,6 +61,7 @@ export class CatalogEngine {
   private syncTask: Promise<void> | null = null;
   private uploadTask: Promise<void> | null = null;
   private activeJob: UploadJob | null = null;
+  private uploadGeneration: string | null = null;
   private clearing: AbortController | null = null;
   private clearTask: Promise<void> | null = null;
   private activeClear: ClearPluJob | null = null;
@@ -93,7 +95,49 @@ export class CatalogEngine {
   }
 
   private changed(): void {
+    this.stopOutdatedUpload();
     if (!this.closed) this.options.changed?.();
+  }
+  private stopOutdatedUpload(): void {
+    const job = this.activeJob;
+    if (!job || !this.uploading || this.uploading.signal.aborted) return;
+    const profile = this.db.getProfile(job.scope);
+    if (
+      !profile?.enabled ||
+      !profile.prefix ||
+      profile.blocked_reason ||
+      profile.prefix !== job.device.barcodePrefix ||
+      profile.revision !== job.profileRevision
+    ) {
+      const error = new Error(
+        'Профиль весов изменился. Требуется настройка и проверка новой этикетки перед повторной загрузкой.',
+      );
+      this.error = error.message;
+      this.uploading.abort(error);
+      return;
+    }
+    const generation = this.db.getCatalogGeneration(job.scope);
+    if (generation === this.uploadGeneration) return;
+    const current = new Map(
+      this.db.allProducts(job.scope).map((product) => [product.id, product]),
+    );
+    const obsolete = job.items.some((item) => {
+      if (item.state !== 'pending' && item.state !== 'in_flight') return false;
+      const product = current.get(item.product.id);
+      if (!product || productIssues(product, job.device).length) return true;
+      return (
+        encodeCatalogProduct(product, job.device).toString('hex') !==
+        item.packetHex
+      );
+    });
+    this.uploadGeneration = generation;
+    if (obsolete) {
+      const error = new Error(
+        'Каталог изменился во время выгрузки. Проверьте товары и подготовьте загрузку заново.',
+      );
+      this.error = error.message;
+      this.uploading.abort(error);
+    }
   }
   private requestRefresh(): void {
     this.token = null;
@@ -135,7 +179,7 @@ export class CatalogEngine {
       ...stored,
       scope,
       sync: { ...stored.sync, running: this.syncing !== null },
-      profile: this.db.getProgress(scope)?.profile ?? stored.profile,
+      profile: this.db.getProfile(scope),
       access: this.online ? 'online' : 'offline',
       accessExpiresAt: new Date(this.grant!.expiresAt).toISOString(),
       device: this.db.getDevice(scope),
@@ -196,7 +240,14 @@ export class CatalogEngine {
         );
       }
       // The endpoint applies the complete backend permission policy, including implied read rights.
-      await request('/v1/pos/catalog/sync-start?unit=kg');
+      const catalog = await request('/v1/pos/catalog/sync-start?unit=kg');
+      const metadata = scaleProfileSchema.safeParse(
+        catalog && typeof catalog === 'object' && 'scale_profile' in catalog
+          ? catalog.scale_profile
+          : null,
+      );
+      if (!metadata.success)
+        throw new Error('Сервер вернул некорректный профиль весов.');
       controller.signal.throwIfAborted();
       if (epoch !== this.epoch) throw new Error('Учётная запись изменилась.');
       if (this.grant && scopeKey(this.grant.scope) !== scopeKey(scope)) {
@@ -221,6 +272,7 @@ export class CatalogEngine {
       controller.signal.throwIfAborted();
       if (epoch !== this.epoch) throw new Error('Учётная запись изменилась.');
       this.grant = grant;
+      this.db.saveProfile(scope, metadata.data);
       this.token = token;
       this.online = true;
       this.refreshRequested = false;
@@ -288,7 +340,7 @@ export class CatalogEngine {
     const scope = this.assertAccess();
     const state = this.db.getState(scope);
     const device = this.db.getDevice(scope);
-    const profile = this.db.getProgress(scope)?.profile ?? state.profile;
+    const profile = this.db.getProfile(scope);
     const blockers: string[] = [];
     if (!state.sync.lastSyncedAt)
       blockers.push('Сначала завершите загрузку каталога из Maria.');
@@ -304,12 +356,25 @@ export class CatalogEngine {
       blockers.push(
         'Настройте весы и подтвердите соответствие этикетки и кодировки.',
       );
+    if (device && device.profileRevision !== profile?.revision)
+      blockers.push(
+        'Требуется настройка: профиль изменился. Проверьте новую этикетку и подтвердите настройки весов.',
+      );
+    if (profile && profile.revision !== (state.sync.profileRevision ?? 0))
+      blockers.push('Завершите синхронизацию каталога с новым профилем весов.');
     if (device && profile?.prefix !== device.barcodePrefix)
       blockers.push(
         'Префикс в настройке весов отличается от профиля организации.',
       );
     const all = this.db.allProducts(scope);
+    const eligible = all.filter(
+      (product) => productIssues(product, device).length === 0,
+    );
     const selected = productIds ? new Set(productIds) : null;
+    if (selected && device?.reloadRequired && eligible.length <= 10_000)
+      blockers.push(
+        'После изменения профиля или очистки подготовьте весь каталог для повторной загрузки на весы.',
+      );
     const products = selected
       ? all.filter((product) => selected.has(product.id))
       : all;
@@ -329,9 +394,11 @@ export class CatalogEngine {
       }
       if (product.scale_plu !== null) seen.add(product.scale_plu);
     }
-    const ready = products.filter(
-      (product) => productIssues(product, device).length === 0,
-    );
+    const ready = selected
+      ? products.filter(
+          (product) => productIssues(product, device).length === 0,
+        )
+      : eligible;
     if (ready.length > 10_000)
       blockers.push(
         'За один запуск можно отправить до 10 000 товаров. Выберите меньшую группу.',
@@ -363,6 +430,10 @@ export class CatalogEngine {
             plu: product.scale_plu!,
           }))
       : [];
+    if (removalRequired.length)
+      blockers.push(
+        'Перед новой загрузкой выполните подтверждённую очистку всех товаров с весов, затем загрузите весь актуальный каталог.',
+      );
     if (this.isUploading())
       blockers.push('Другая операция с весами ещё выполняется.');
     const uncertain = device
@@ -376,6 +447,8 @@ export class CatalogEngine {
         JSON.stringify({
           ready,
           excluded,
+          removalRequired,
+          blockers,
           profile,
           device,
           uncertainCount,
@@ -422,6 +495,7 @@ export class CatalogEngine {
       scope,
       device,
       catalogSyncedAt: preview.catalogSyncedAt!,
+      profileRevision: this.db.getProfile(scope)!.revision,
       createdAt: new Date().toISOString(),
       finishedAt: null,
       status: 'running',
@@ -438,6 +512,7 @@ export class CatalogEngine {
     this.db.saveUpload(job);
     this.clearConfirmation = null;
     this.activeJob = job;
+    this.uploadGeneration = this.db.getCatalogGeneration(scope);
     const controller = new AbortController();
     this.uploading = controller;
     this.uploadTask = (this.options.runUpload ?? runUpload)(
@@ -450,14 +525,7 @@ export class CatalogEngine {
           scopeKey(this.grant.scope) !== scopeKey(scope)
         )
           controller.abort();
-        const latestProfile = this.db.getProgress(scope)?.profile;
-        if (
-          latestProfile &&
-          (!latestProfile.enabled ||
-            latestProfile.blocked_reason ||
-            latestProfile.prefix !== device.barcodePrefix)
-        )
-          controller.abort();
+        this.stopOutdatedUpload();
         this.db.saveUpload(snapshot);
         this.activeJob = snapshot;
         this.changed();
@@ -465,6 +533,39 @@ export class CatalogEngine {
     )
       .then((result) => {
         this.activeJob = result;
+        const currentProfile = this.db.getProfile(scope);
+        const currentDevice = this.db.getDevice(scope);
+        if (
+          result.status === 'completed' &&
+          currentDevice?.reloadRequired &&
+          currentProfile &&
+          currentProfile.revision === job.profileRevision &&
+          currentDevice.profileRevision === job.profileRevision &&
+          currentDevice.scaleIp === device.scaleIp &&
+          currentDevice.port === device.port
+        ) {
+          const packets = this.db.uploadedPackets(
+            scope,
+            currentDevice,
+            currentProfile.revision,
+          );
+          const ready = this.db
+            .allProducts(scope)
+            .filter(
+              (product) => productIssues(product, currentDevice).length === 0,
+            );
+          if (
+            ready.every(
+              (product) =>
+                packets.get(product.id) ===
+                encodeCatalogProduct(product, currentDevice).toString('hex'),
+            )
+          )
+            this.db.saveDevice(scope, {
+              ...currentDevice,
+              reloadRequired: false,
+            });
+        }
       })
       .catch((error: unknown) => {
         const result = structuredClone(this.activeJob ?? job);
@@ -484,6 +585,7 @@ export class CatalogEngine {
       })
       .finally(() => {
         this.uploading = null;
+        this.uploadGeneration = null;
         this.changed();
       });
     this.changed();
@@ -657,14 +759,30 @@ export class CatalogEngine {
             'Остановите отправку перед изменением настроек весов.',
           );
         validateProfile(input.device, getNetworkAdapters());
-        const prefix = (
-          this.db.getProgress(scope)?.profile ?? this.db.getState(scope).profile
-        )?.prefix;
-        if (input.device.barcodePrefix !== prefix)
+        const profile = this.db.getProfile(scope);
+        if (input.device.barcodePrefix !== profile?.prefix)
           throw new Error(
             'Используйте сохранённый в Maria префикс организации.',
           );
-        this.db.saveDevice(scope, input.device);
+        if (
+          input.device.setupConfirmed &&
+          input.device.profileRevision !== profile?.revision
+        )
+          throw new Error(
+            'Профиль изменился. Проверьте новую этикетку и подтвердите настройки заново.',
+          );
+        if (
+          input.device.setupConfirmed &&
+          (!profile?.enabled || !profile.prefix)
+        )
+          throw new Error(
+            'Профиль отключён или префикс не назначен. Выпуск новых этикеток недоступен.',
+          );
+        this.db.saveDevice(scope, {
+          ...input.device,
+          profileRevision: profile?.revision,
+          reloadRequired: this.db.getDevice(scope)?.reloadRequired ?? false,
+        });
         this.clearConfirmation = null;
         this.changed();
         return this.state();

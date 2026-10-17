@@ -87,6 +87,8 @@ beforeEach(() => {
       prefix: '21',
       enabled: true,
       blocked_reason: null,
+      revision: 0,
+      issued_plu_ranges: [[1, 1]],
     },
     device: {
       scaleIp: '192.168.1.8',
@@ -95,6 +97,7 @@ beforeEach(() => {
       nameEncoding: 'windows-1251',
       barcodePrefix: '21',
       setupConfirmed: true,
+      profileRevision: 0,
     },
   };
   preview = {
@@ -139,6 +142,30 @@ const openDevice = async () => {
 };
 
 describe('weighted catalog', () => {
+  it.each([
+    [10000, false],
+    [10001, true],
+  ])(
+    'explains grouped reloads only above the job limit for %i products',
+    async (total, grouped) => {
+      state = {
+        ...state,
+        total,
+        device: { ...state.device!, reloadRequired: true },
+      };
+      mount();
+      await openCatalog();
+      expect(
+        screen.getByText(/После изменения профиля или очистки весов/),
+      ).toBeVisible();
+      const instruction = screen.queryByText(
+        /отправляйте готовые товары группами до 10 000/,
+      );
+      if (grouped) expect(instruction).toBeVisible();
+      else expect(instruction).not.toBeInTheDocument();
+    },
+  );
+
   it('shows clearing only in device settings and drops its confirmation after navigation', async () => {
     mount();
     expect(
@@ -516,6 +543,7 @@ describe('weighted catalog', () => {
       ...state.device!,
       barcodePrefix: '20',
       setupConfirmed: true,
+      profileRevision: 0,
     };
     const browser = userEvent.setup();
     mount();
@@ -546,6 +574,109 @@ describe('weighted catalog', () => {
     );
   });
 
+  it.each(['revision', 'prefix', 'enabled', 'store'] as const)(
+    'invalidates prepared uploads after a metadata-only %s change',
+    async (changed) => {
+      mount();
+      await openCatalog();
+      await userEvent.click(
+        screen.getByRole('button', { name: 'Подготовить весь каталог' }),
+      );
+      const upload = await screen.findByRole('button', {
+        name: 'Загрузить 1 товар на весы',
+      });
+      expect(upload).toBeEnabled();
+      state = {
+        ...state,
+        scope: {
+          ...state.scope!,
+          storeId: changed === 'store' ? 'other-store' : 'store',
+        },
+        profile: {
+          ...state.profile!,
+          revision: changed === 'revision' ? 1 : 0,
+          prefix: changed === 'prefix' ? '27' : '21',
+          enabled: changed !== 'enabled',
+        },
+      };
+      await emitState();
+      expect(upload).toBeDisabled();
+      await userEvent.click(upload);
+      expect(
+        request.mock.calls.some(([input]) => input.type === 'upload'),
+      ).toBe(false);
+    },
+  );
+
+  it('resets a saved label confirmation when revision changes with the same prefix', async () => {
+    mount();
+    await openDevice();
+    const confirmed = () =>
+      screen.getByRole('checkbox', { name: /Настройки весов проверены/ });
+    expect(confirmed()).toBeChecked();
+    state = {
+      ...state,
+      profile: { ...state.profile!, revision: 1 },
+    };
+    await emitState();
+    expect(confirmed()).not.toBeChecked();
+    expect(screen.getByText('Требуется настройка')).toBeVisible();
+    expect(screen.getByText(/старые этикетки/i)).toBeVisible();
+    await userEvent.click(confirmed());
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Сохранить подключение' }),
+    );
+    expect(request).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'save-device',
+        device: expect.objectContaining({
+          profileRevision: 1,
+          barcodePrefix: '21',
+          setupConfirmed: true,
+        }),
+      }),
+    );
+  });
+
+  it.each([
+    ['27', '2704245001850'],
+    ['05', '0504245001858'],
+  ])(
+    'shows the expected manual label example with prefix %s',
+    async (prefix, barcode) => {
+      state.profile = { ...state.profile!, prefix };
+      mount();
+      await openDevice();
+      expect(
+        screen.getByRole('status', { name: 'Ожидаемый штрихкод примера' }),
+      ).toHaveTextContent(barcode);
+      expect(screen.getByText(/PLU 4245.*0,185 кг/)).toBeVisible();
+      expect(
+        request.mock.calls.some(([input]) => input.type === 'upload'),
+      ).toBe(false);
+    },
+  );
+
+  it('offers the supported confirmed clear-all flow for obsolete PLUs', async () => {
+    preview.removalRequired = [{ id: 'old', name: 'Старый товар', plu: 9 }];
+    mount();
+    await openCatalog();
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Подготовить весь каталог' }),
+    );
+    await userEvent.click(
+      await screen.findByRole('button', {
+        name: 'Открыть очистку в настройках',
+      }),
+    );
+    expect(
+      screen.getByRole('button', { name: 'Удалить все товары с весов' }),
+    ).toBeVisible();
+    expect(
+      request.mock.calls.some(([input]) => input.type === 'clear-products'),
+    ).toBe(false);
+  });
+
   it.each([null, '21'])(
     'directs setup to Maria when the profile is disabled with prefix %s',
     async (prefix) => {
@@ -553,6 +684,8 @@ describe('weighted catalog', () => {
         format: 'ean13-weight-v1',
         enabled: false,
         blocked_reason: null,
+        revision: 0,
+        issued_plu_ranges: [[1, 1]],
         prefix,
       };
       state.device = null;

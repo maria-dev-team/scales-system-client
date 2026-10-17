@@ -1,0 +1,19 @@
+{
+  "format": "ean13-weight-v1",
+  "prefix": "20",
+  "note": "Synthetic test prefix only; hardware profile must be verified before activation.",
+  "valid": [
+    { "barcode": "2000001001851", "scalePlu": 1, "quantity": "0.185" },
+    { "barcode": "2000001000014", "scalePlu": 1, "quantity": "0.001" },
+    { "barcode": "2000001010006", "scalePlu": 1, "quantity": "1" },
+    { "barcode": "2099999999998", "scalePlu": 99999, "quantity": "99.999" }
+  ],
+  "invalid": ["2000001001852", "2000000001852", "2000001000007"],
+  "ordinary": [
+    "2900001001854",
+    "4870000000012",
+    "20",
+    "200000100185",
+    "(01)04870000000012(21)serial"
+  ]
+}

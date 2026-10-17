@@ -27,6 +27,29 @@ const product: CatalogProduct = {
 };
 
 describe('catalog PLU encoding', () => {
+  it.each([
+    ['05', '05'],
+    ['27', '27'],
+  ])(
+    'preserves prefix %s and the backend PLU while ignoring an ordinary UMAG barcode',
+    (prefix, department) => {
+      const packet = encodeCatalogProduct(
+        { ...product, barcode: '2763189', scale_plu: 4245 },
+        { ...device, barcodePrefix: prefix },
+      );
+      expect(packet.subarray(39, 42).toString('hex')).toBe('004245');
+      expect(packet.subarray(62, 67).toString('hex')).toBe('0000004245');
+      expect(packet.subarray(44, 46).toString('hex')).toBe(`${department}07`);
+      expect(packet.subarray(46, 51).toString('hex')).toBe('0000123404');
+    },
+  );
+
+  it('does not silently replace an explicitly empty scale name with the product name', () => {
+    expect(() =>
+      encodeCatalogProduct({ ...product, scale_name: '' }, device),
+    ).toThrow('название');
+  });
+
   it('writes one PLU with separate prefix, type 07, exact price and zero unused slots', () => {
     const packet = encodeCatalogProduct(product, device);
     expect(packet.length).toBe(261);
@@ -133,6 +156,9 @@ describe('catalog PLU encoding', () => {
     ).toThrow();
     expect(() =>
       encodeCatalogProduct(product, { ...device, barcodePrefix: '2x' }),
+    ).toThrow();
+    expect(() =>
+      encodeCatalogProduct(product, { ...device, barcodePrefix: '27\n' }),
     ).toThrow();
   });
 

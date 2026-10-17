@@ -32,6 +32,8 @@ const profile = {
   prefix: '21',
   enabled: true,
   blocked_reason: null,
+  revision: 0,
+  issued_plu_ranges: [] as [number, number][],
 };
 const delta = {
   products: [],
@@ -53,6 +55,53 @@ const setup = (
   };
 };
 afterEach(() => databases.splice(0).forEach((db) => db.close()));
+
+it('keeps newer page metadata when a later empty delta has an older revision', async () => {
+  const newer = {
+    ...profile,
+    prefix: '27',
+    revision: 2,
+    issued_plu_ranges: [[4245, 4245]] as [number, number][],
+  };
+  const { db, sync } = setup(async (path) => {
+    if (path.includes('/sync-start?'))
+      return {
+        cursor: 'baseline',
+        scale_profile: { ...profile, prefix: '05', revision: 1 },
+      };
+    if (path.includes('/page?'))
+      return { products: [product], next_cursor: null, scale_profile: newer };
+    expect(db.getState(scope).profile).toEqual(newer);
+    return {
+      ...delta,
+      scale_profile: { ...profile, prefix: '05', revision: 1 },
+    };
+  });
+  await sync.run(scope, new AbortController().signal);
+  expect(db.getState(scope).profile).toEqual(newer);
+  expect(db.getState(scope).sync.profileRevision).toBe(2);
+});
+
+it.each([
+  { revision: -1 },
+  { revision: 1.5 },
+  { issued_plu_ranges: [[5, 1]] },
+  { issued_plu_ranges: [[0, 1]] },
+  { issued_plu_ranges: [[1, 100000]] },
+  { issued_plu_ranges: [[1, 2, 3]] },
+])(
+  'rejects malformed profile metadata before creating a snapshot: %j',
+  async (invalid) => {
+    const { db, sync } = setup(async () => ({
+      cursor: 'baseline',
+      scale_profile: { ...profile, ...invalid },
+    }));
+    await expect(sync.run(scope, new AbortController().signal)).rejects.toThrow(
+      'некорректный пакет',
+    );
+    expect(db.getProgress(scope)).toBeNull();
+  },
+);
 
 it('starts the kg journal before page walking and makes products visible only after catchup', async () => {
   const paths: string[] = [];
@@ -79,29 +128,85 @@ it('starts the kg journal before page walking and makes products visible only af
   expect(db.getState(scope).sync.lastSyncedAt).not.toBeNull();
 });
 
-it('retains waiting progress and profile without marking a fresh catalog, then resumes deltas', async () => {
-  let waiting = true;
+it.each([false, true])(
+  'drains more than twenty change pages in one run (existing catalog: %s)',
+  async (existingCatalog) => {
+    let page = 0;
+    const { db, sync } = setup(async (path) => {
+      if (path.includes('/sync-start?'))
+        return { cursor: 'baseline', scale_profile: profile };
+      if (path.includes('/page?'))
+        return { products: [product], next_cursor: null };
+      const cursor = new URL(path, scope.apiUrl).searchParams.get('cursor');
+      expect(cursor).toBe(page === 0 ? 'baseline' : `changes-${page}`);
+      expect(db.allProducts(scope)).toEqual(existingCatalog ? [product] : []);
+      page++;
+      return {
+        ...delta,
+        products: [
+          {
+            ...product,
+            id:
+              page === 1
+                ? product.id
+                : `44444444-4444-4444-8444-${String(page).padStart(12, '0')}`,
+            retail_price: '200.00',
+          },
+        ],
+        cursor: `changes-${page}`,
+        has_more: page < 22,
+      };
+    });
+    if (existingCatalog) {
+      db.beginSnapshot(scope, 'baseline', profile);
+      db.applyPage(scope, [product], null);
+      db.applyChanges(scope, { ...delta, cursor: 'baseline' });
+      db.finishSync(scope, '2026-10-11T00:00:00Z');
+    }
+
+    await sync.run(scope, new AbortController().signal);
+
+    expect(db.allProducts(scope)).toHaveLength(22);
+    expect(
+      db.allProducts(scope).every((item) => item.retail_price === '200.00'),
+    ).toBe(true);
+    expect(db.getProgress(scope)?.cursor).toBe('changes-22');
+    expect(db.getState(scope).sync).toMatchObject({
+      phase: 'idle',
+      error: null,
+    });
+    expect(db.getState(scope).sync.lastSyncedAt).not.toBeNull();
+  },
+);
+
+it('waits for pending server transactions and finishes without a second run', async () => {
+  let changes = 0;
   const { db, sync } = setup(async (path) => {
     if (path.includes('/sync-start?'))
       return { cursor: 'baseline', scale_profile: profile };
     if (path.includes('/page?'))
       return { products: [product], next_cursor: null };
+    if (changes > 0) {
+      expect(new URL(path, scope.apiUrl).searchParams.get('cursor')).toBe(
+        'delta',
+      );
+      expect(db.getState(scope)).toMatchObject({
+        total: 0,
+        sync: { phase: 'changes', lastSyncedAt: null },
+      });
+      expect(db.getProgress(scope)).toMatchObject({
+        cursor: 'delta',
+        waiting: true,
+        profile: { prefix: '22' },
+      });
+    }
+    changes++;
     return {
       ...delta,
-      waiting_for_transactions: waiting,
-      scale_profile: { ...profile, prefix: '22' },
+      waiting_for_transactions: changes < 3,
+      scale_profile: { ...profile, prefix: '22', revision: 1 },
     };
   });
-  await sync.run(scope, new AbortController().signal);
-  expect(db.getState(scope)).toMatchObject({
-    total: 0,
-    sync: { phase: 'changes', lastSyncedAt: null },
-  });
-  expect(db.getProgress(scope)).toMatchObject({
-    cursor: 'delta',
-    waiting: true,
-  });
-  waiting = false;
   await sync.run(scope, new AbortController().signal);
   expect(db.getState(scope)).toMatchObject({
     total: 1,

@@ -43,12 +43,15 @@ function mount() {
       nameEncoding: 'ascii',
       barcodePrefix: '20',
       setupConfirmed: true,
+      profileRevision: 0,
     },
     profile: {
       prefix: '20',
       format: 'ean13-weight-v1',
       enabled: true,
       blocked_reason: null,
+      revision: 0,
+      issued_plu_ranges: [[1, 1]],
     },
     sync: {
       phase: 'idle',

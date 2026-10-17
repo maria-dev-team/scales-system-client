@@ -13,7 +13,7 @@ for (let byte = 0x20; byte <= 0xff; byte++) {
 }
 
 function nameBytes(product: CatalogProduct, device: ScaleDevice): Buffer {
-  const source = product.scale_name?.trim() ? product.scale_name : product.name;
+  const source = product.scale_name ?? product.name;
   if (/[\p{C}]/u.test(source))
     throw new Error(
       'Название содержит управляющие или неподдерживаемые символы',
