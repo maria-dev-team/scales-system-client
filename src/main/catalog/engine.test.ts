@@ -29,6 +29,8 @@ const profile = {
   prefix: '21',
   enabled: true,
   blocked_reason: null,
+  revision: 0,
+  issued_plu_ranges: [] as [number, number][],
 } as const;
 const directories: string[] = [];
 const databases: CatalogDatabase[] = [];
@@ -450,13 +452,113 @@ describe('catalog access and upload orchestration', () => {
       cursor: 'pending',
       has_more: false,
       waiting_for_transactions: true,
-      scale_profile: { ...profile, enabled: false },
+      scale_profile: { ...profile, enabled: false, revision: 1 },
     });
     expect(engine.state().profile?.enabled).toBe(false);
     const preview = (await engine.request({ type: 'preview' })) as {
       blockers: string[];
     };
     expect(preview.blockers.join(' ')).toContain('Включите профиль');
+  });
+
+  it('keeps synchronization running while transactions are pending and finishes without another manual request', async () => {
+    const { engine, db, fetcher } = setup();
+    const original = fetcher.getMockImplementation()!;
+    let releaseChanges!: () => void;
+    const pendingChanges = new Promise<void>((resolve) => {
+      releaseChanges = resolve;
+    });
+    let changesRequests = 0;
+    fetcher.mockImplementation(async (input, init) => {
+      if (new URL(String(input)).pathname.endsWith('/changes')) {
+        changesRequests++;
+        if (changesRequests === 1)
+          return new Response(
+            JSON.stringify({
+              data: {
+                products: [],
+                deleted_ids: [],
+                categories_changed: false,
+                cursor: 'waiting',
+                has_more: false,
+                waiting_for_transactions: true,
+                scale_profile: profile,
+              },
+            }),
+          );
+        expect(new URL(String(input)).searchParams.get('cursor')).toBe(
+          'waiting',
+        );
+        await pendingChanges;
+      }
+      return original(input, init);
+    });
+    try {
+      await engine.request({ type: 'connect', accessToken: 'token' });
+      await vi.waitFor(() =>
+        expect(db.getProgress(scope)?.cursor).toBe('waiting'),
+      );
+      expect(engine.state().sync).toMatchObject({
+        running: true,
+        phase: 'changes',
+        lastSyncedAt: null,
+      });
+      releaseChanges();
+      await vi.waitFor(
+        () => expect(engine.state().sync.lastSyncedAt).not.toBeNull(),
+        { timeout: 4000 },
+      );
+      expect(engine.state().sync).toMatchObject({
+        running: false,
+        phase: 'idle',
+        error: null,
+      });
+      expect(changesRequests).toBe(2);
+    } finally {
+      releaseChanges();
+      await engine.close();
+    }
+  });
+
+  it('cancels synchronization while transactions are pending and does not resume on later ticks', async () => {
+    const { engine, db, fetcher } = setup();
+    const original = fetcher.getMockImplementation()!;
+    fetcher.mockImplementation(async (input, init) => {
+      if (new URL(String(input)).pathname.endsWith('/changes'))
+        return new Response(
+          JSON.stringify({
+            data: {
+              products: [],
+              deleted_ids: [],
+              categories_changed: false,
+              cursor: 'waiting',
+              has_more: false,
+              waiting_for_transactions: true,
+              scale_profile: profile,
+            },
+          }),
+        );
+      return original(input, init);
+    });
+    try {
+      await engine.request({ type: 'connect', accessToken: 'token' });
+      await vi.waitFor(() =>
+        expect(db.getProgress(scope)?.cursor).toBe('waiting'),
+      );
+      expect(engine.state().sync.running).toBe(true);
+      await engine.request({ type: 'cancel-sync' });
+      expect(engine.state().sync).toMatchObject({
+        running: false,
+        phase: 'cancelled',
+        lastSyncedAt: null,
+      });
+      fetcher.mockClear();
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 120_000);
+      await engine.tick();
+      expect(fetcher).not.toHaveBeenCalled();
+    } finally {
+      await engine.close();
+    }
   });
 
   it('keeps manual synchronization cancellation paused during later ticks', async () => {
@@ -616,6 +718,7 @@ describe('catalog access and upload orchestration', () => {
         nameEncoding: 'ascii',
         barcodePrefix: '21',
         setupConfirmed: true,
+        profileRevision: 0,
       },
     });
     const oldPreview = (await engine.request({

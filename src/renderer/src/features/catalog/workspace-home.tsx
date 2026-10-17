@@ -73,6 +73,13 @@ function deviceSummary(state: CatalogState): Summary {
       detail: 'Проверьте префикс на весах и подтвердите настройки повторно.',
       tone: 'warning',
     };
+  if (state.device.profileRevision !== state.profile.revision)
+    return {
+      label: 'Требуется настройка',
+      detail:
+        'Профиль Maria изменился. Проверьте настройки весов и пробную этикетку повторно.',
+      tone: 'warning',
+    };
   if (!state.device.setupConfirmed)
     return {
       label: 'Нужна проверка этикетки',

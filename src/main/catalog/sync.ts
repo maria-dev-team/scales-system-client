@@ -4,16 +4,8 @@ import { z } from 'zod';
 import type { CatalogProduct, CatalogScope } from '../../shared/catalog';
 import { CatalogApiError } from './api';
 import { CatalogDatabase, scopeKey } from './database';
+import { scaleProfileSchema } from './profile';
 
-const profileSchema = z.object({
-  format: z.literal('ean13-weight-v1'),
-  prefix: z
-    .string()
-    .regex(/^\d{2}$/)
-    .nullable(),
-  enabled: z.boolean(),
-  blocked_reason: z.literal('barcode_conflict').nullable(),
-});
 const productSchema = z.object({
   id: z.string().uuid(),
   organization_id: z.string().uuid(),
@@ -33,11 +25,12 @@ const productSchema = z.object({
 const cursorSchema = z.string().min(1).max(8192);
 const startSchema = z.object({
   cursor: cursorSchema,
-  scale_profile: profileSchema,
+  scale_profile: scaleProfileSchema,
 });
 const pageSchema = z.object({
   products: z.array(productSchema).max(250),
   next_cursor: z.string().uuid().nullable(),
+  scale_profile: scaleProfileSchema.optional(),
 });
 const changesSchema = z.object({
   products: z.array(productSchema).max(250),
@@ -46,7 +39,7 @@ const changesSchema = z.object({
   has_more: z.boolean(),
   categories_changed: z.boolean(),
   waiting_for_transactions: z.boolean().optional(),
-  scale_profile: profileSchema,
+  scale_profile: scaleProfileSchema,
 });
 const parse = <T>(schema: z.ZodType<T>, input: unknown): T => {
   const result = schema.safeParse(input);
@@ -139,13 +132,18 @@ export class CatalogSync {
                 page.next_cursor !== page.products.at(-1)?.id)
             )
               throw new Error('Нарушен порядок страниц каталога.');
-            this.db.applyPage(scope, page.products, page.next_cursor);
+            this.db.applyPage(
+              scope,
+              page.products,
+              page.next_cursor,
+              page.scale_profile,
+            );
             this.changed();
             progress = this.db.getProgress(scope)!;
             await this.pause(250, signal);
             signal.throwIfAborted();
           }
-          for (let index = 0; index < 20; index++) {
+          while (true) {
             const params = new URLSearchParams({
               unit: 'kg',
               limit: '250',
@@ -167,17 +165,18 @@ export class CatalogSync {
               throw new Error('Некорректный курсор или удаления каталога.');
             this.db.applyChanges(scope, changes);
             this.changed();
-            if (!changes.has_more) {
-              if (!changes.waiting_for_transactions)
-                this.db.finishSync(scope, new Date().toISOString());
+            if (!changes.has_more && !changes.waiting_for_transactions) {
+              this.db.finishSync(scope, new Date().toISOString());
               this.changed();
               return;
             }
             progress = this.db.getProgress(scope)!;
-            await this.pause(250, signal);
+            await this.pause(
+              changes.waiting_for_transactions ? 1000 : 250,
+              signal,
+            );
             signal.throwIfAborted();
           }
-          return;
         } catch (error) {
           signal.throwIfAborted();
           if (

@@ -76,6 +76,7 @@ export function CatalogView({
   const [prepared, setPrepared] = useState<{
     result: UploadPreview;
     ids?: string[];
+    context: string;
   } | null>(null);
   const [confirmUncertain, setConfirmUncertain] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
@@ -83,6 +84,12 @@ export function CatalogView({
   const busy = pending !== null;
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const uploadContext = JSON.stringify([
+    state.scope,
+    state.profile?.prefix,
+    state.profile?.enabled,
+    state.profile?.revision,
+  ]);
 
   useEffect(() => {
     if (!api) return;
@@ -187,7 +194,7 @@ export function CatalogView({
           type: 'preview',
           ...(ids ? { productIds: ids } : {}),
         });
-        setPrepared({ result, ids });
+        setPrepared({ result, ids, context: uploadContext });
         if (result.blockers.length) {
           toast.warning('Загрузка пока недоступна', {
             description: result.blockers.join(' '),
@@ -216,7 +223,9 @@ export function CatalogView({
     ).length ?? 0;
   const preview = prepared?.result;
   const previewStale =
-    preview && preview.catalogSyncedAt !== state.sync.lastSyncedAt;
+    preview &&
+    (preview.catalogSyncedAt !== state.sync.lastSyncedAt ||
+      prepared.context !== uploadContext);
 
   return (
     <main className="mx-auto w-full max-w-6xl space-y-6 p-4 sm:p-8">
@@ -378,10 +387,11 @@ export function CatalogView({
               {deviceOpened ? (
                 <div hidden={section !== 'device'} className="space-y-4">
                   <DeviceForm
-                    key={`${JSON.stringify(state.device)}-${state.profile?.prefix}`}
+                    key={`${JSON.stringify(state.device)}-${uploadContext}`}
                     device={state.device}
                     prefix={state.profile?.prefix ?? null}
                     profileEnabled={state.profile?.enabled === true}
+                    profileRevision={state.profile?.revision ?? 0}
                     adapters={adapters}
                     busy={locked}
                     saving={pending === 'Сохраняем подключение…'}
@@ -463,6 +473,22 @@ export function CatalogView({
                     </Button>
                   </section>
                   <section className={box} aria-label="Синхронизация каталога">
+                    {state.device?.reloadRequired ? (
+                      <p
+                        role="status"
+                        className="rounded-lg bg-warning-muted/50 p-4 text-sm text-warning"
+                      >
+                        После изменения профиля или очистки весов подготовьте
+                        весь каталог и загрузите его заново.
+                        {state.total > 10000 ? (
+                          <span className="mt-2 block">
+                            Каталог больше 10 000 товаров: отправляйте готовые
+                            товары группами до 10 000. Проверка полной загрузки
+                            завершится после передачи всех готовых товаров.
+                          </span>
+                        ) : null}
+                      </p>
+                    ) : null}
                     <div className="flex flex-wrap items-center justify-between gap-4">
                       <div>
                         <h2 className="font-semibold">
@@ -731,10 +757,20 @@ export function CatalogView({
                       {preview.removalRequired.length ? (
                         <div className="space-y-2 text-sm text-amber-700 dark:text-amber-400">
                           <p>
-                            На весах могут остаться устаревшие товары. Удалите
-                            отдельные PLU через RLS или очистите все товары в
-                            настройках весов перед новой загрузкой.
+                            На весах остались записи, которые больше нельзя
+                            выгружать. Откройте настройки и подтвердите удаление
+                            всех товаров с этих весов. После подтверждённой
+                            очистки подготовьте и загрузите весь актуальный
+                            каталог заново.
                           </p>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            disabled={locked}
+                            onClick={openDevice}
+                          >
+                            Открыть очистку в настройках
+                          </Button>
                           <ul>
                             {preview.removalRequired.map((item) => (
                               <li key={item.id}>
@@ -746,7 +782,8 @@ export function CatalogView({
                       ) : null}
                       {previewStale ? (
                         <p className="text-sm text-amber-700">
-                          Каталог обновился. Подготовьте загрузку повторно.
+                          Каталог или профиль весов изменился. Подготовьте
+                          загрузку повторно.
                         </p>
                       ) : null}
                       {preview.uncertainCount > 0 ? (

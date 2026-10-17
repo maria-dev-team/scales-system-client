@@ -70,12 +70,18 @@ export async function runUpload(
   }
 
   function checkActive(ignoreAbort: boolean): void {
-    if (!ignoreAbort && signal.aborted) throw new Error('Загрузка отменена');
+    if (!ignoreAbort && signal.aborted) throw cancellationError();
     if (socketError) throw socketError;
   }
 
   function abort(): void {
-    rejectPending?.(new Error('Загрузка отменена'));
+    rejectPending?.(cancellationError());
+  }
+
+  function cancellationError(): Error {
+    return signal.reason instanceof Error && signal.reason.name !== 'AbortError'
+      ? signal.reason
+      : new Error('Загрузка отменена');
   }
 
   async function exchange(

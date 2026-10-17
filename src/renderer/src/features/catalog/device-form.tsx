@@ -12,6 +12,7 @@ import { Input } from '@renderer/common/components/ui/input';
 
 import type { ScaleDevice } from '../../../../shared/catalog';
 import type { NetworkAdapter } from '../../../../shared/diagnostics';
+import { encodeWeightedLabel } from '../../../../shared/weighted-label';
 
 const box = 'space-y-5 rounded-xl border border-border bg-card p-5 sm:p-6';
 const field = 'grid min-w-0 content-start gap-2 text-sm';
@@ -22,6 +23,7 @@ export function DeviceForm({
   device,
   prefix,
   profileEnabled,
+  profileRevision = 0,
   adapters,
   busy,
   saving = false,
@@ -33,6 +35,7 @@ export function DeviceForm({
   device: ScaleDevice | null;
   prefix: string | null;
   profileEnabled: boolean;
+  profileRevision?: number;
   adapters: NetworkAdapter[];
   busy: boolean;
   saving?: boolean;
@@ -49,10 +52,19 @@ export function DeviceForm({
       nameEncoding: 'windows-1251',
     }),
     barcodePrefix: prefix ?? '',
+    profileRevision,
     setupConfirmed: Boolean(
-      prefix && device?.barcodePrefix === prefix && device.setupConfirmed,
+      prefix &&
+      profileEnabled &&
+      device?.barcodePrefix === prefix &&
+      device.profileRevision === profileRevision &&
+      device.setupConfirmed,
     ),
   }));
+  const profileChanged =
+    device &&
+    (device.barcodePrefix !== prefix ||
+      device.profileRevision !== profileRevision);
   const change = (values: Partial<ScaleDevice>): void => {
     setDraft((current) => ({ ...current, ...values }));
     onEdit();
@@ -231,12 +243,15 @@ export function DeviceForm({
             </div>
           </div>
         ) : null}
-        {prefix && device && device.barcodePrefix !== prefix ? (
-          <p className="rounded-lg border border-warning/25 bg-warning-muted/50 p-4 text-sm leading-6">
-            Сохранённые настройки весов не совпадают с префиксом Maria.
-            Проверьте Dept и пробную этикетку, затем подтвердите настройку
-            повторно.
-          </p>
+        {prefix && profileChanged ? (
+          <div className="space-y-2 rounded-lg border border-warning/25 bg-warning-muted/50 p-4 text-sm leading-6">
+            <p className="font-semibold">Требуется настройка</p>
+            <p>
+              Профиль Maria изменился. Перенастройте весы и проверьте пробную
+              этикетку перед новой выгрузкой. После смены префикса замените
+              старые этикетки: Maria распознаёт вес только по новому префиксу.
+            </p>
+          </div>
         ) : null}
         <div className="space-y-3 border-t border-border pt-5">
           <h3 className="text-sm font-medium">Установите на весах</h3>
@@ -256,6 +271,34 @@ export function DeviceForm({
               <dd className="text-sm font-semibold">2 знака после запятой</dd>
             </div>
           </dl>
+          <details className="rounded-lg bg-muted/60 p-4 text-sm leading-6">
+            <summary className="cursor-pointer font-medium">
+              Как настроить RLS1100 вручную
+            </summary>
+            <ol className="mt-3 list-decimal space-y-2 pl-5">
+              <li>
+                Удерживайте SETTING около 3 секунд. Выбирайте параметры
+                стрелками, подтверждайте PRN/ENTER.
+              </li>
+              <li>
+                В параметре J установите 2 знака после запятой для цены.
+                Выберите тип штрихкода 07. В Edit barcode задайте отдел
+                (Department) {prefix ?? 'равным префиксу из Maria'}.
+              </li>
+              <li>
+                Для проверки карточки удерживайте PLU, введите её LFCode и
+                нажмите PRN/ENTER. Проверьте C — PLU из Maria, U — kg, D — отдел{' '}
+                {prefix ?? 'из Maria'}, B — 07; сохраните через S. Обычный
+                штрихкод товара для PLU не используйте.
+              </li>
+              <li>
+                Напечатайте пробную этикетку и проверьте её в POS. Сохранение
+                подключения в приложении само по себе не меняет глобальные
+                параметры печати весов. После проверки отметьте подтверждение
+                ниже и сохраните подключение.
+              </li>
+            </ol>
+          </details>
         </div>
       </section>
 
@@ -279,9 +322,28 @@ export function DeviceForm({
           id="scale-label-format"
           className="rounded-lg bg-muted/60 px-4 py-3 text-sm leading-6 text-muted-foreground"
         >
-          EAN-13: префикс + PLU (5 цифр) + вес в граммах (5 цифр) + контрольная
-          цифра.
+          EAN-13: префикс (2 цифры) + PLU (5 цифр) + вес в граммах (5 цифр) +
+          контрольная цифра. Ведущие нули обязательны. Цена в штрихкод не
+          входит.
         </p>
+        {prefix ? (
+          <div className="space-y-2 rounded-lg border border-border p-4 text-sm leading-6">
+            <p className="font-medium">
+              Ожидаемый пример: PLU 4245, вес 0,185 кг
+            </p>
+            <output
+              aria-label="Ожидаемый штрихкод примера"
+              className="block break-all font-mono text-lg font-semibold tracking-wider"
+            >
+              {encodeWeightedLabel(prefix, 4245, 185)}
+            </output>
+            <p className="text-xs leading-5 text-muted-foreground">
+              Это образец формата для ручного сравнения. Он не создаёт товар на
+              весах и не запускает печать. Для другого PLU или веса цифры будут
+              отличаться.
+            </p>
+          </div>
+        ) : null}
         <label
           className={`flex items-start gap-3 rounded-lg border border-border p-4 text-sm leading-6 ${busy || !prefix || !profileEnabled ? 'text-muted-foreground' : 'cursor-pointer hover:bg-muted/40'}`}
         >
@@ -295,6 +357,7 @@ export function DeviceForm({
               change({
                 setupConfirmed: event.target.checked,
                 barcodePrefix: prefix ?? '',
+                profileRevision,
               })
             }
           />

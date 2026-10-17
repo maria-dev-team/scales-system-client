@@ -27,6 +27,8 @@ const profile: ScaleBarcodeProfile = {
   prefix: '21',
   enabled: true,
   blocked_reason: null,
+  revision: 0,
+  issued_plu_ranges: [[1, 1]],
 };
 const product: CatalogProduct = {
   id: 'apple',
@@ -120,13 +122,17 @@ afterEach(() => {
 it('keeps the active catalog across a restart until staged pages and catchup commit', () => {
   const first = open();
   complete(first.db);
-  first.db.beginSnapshot(scope, 'next-base', { ...profile, prefix: '22' });
+  first.db.beginSnapshot(scope, 'next-base', {
+    ...profile,
+    prefix: '22',
+    revision: 1,
+  });
   first.db.applyPage(scope, [{ ...product, retail_price: '200.00' }], 'apple');
   first.db.close();
   databases.splice(databases.indexOf(first.db), 1);
   const { db } = open(first.path);
   expect(db.allProducts(scope)[0].retail_price).toBe('100.00');
-  expect(db.getState(scope).profile?.prefix).toBe('21');
+  expect(db.getState(scope).profile?.prefix).toBe('22');
   expect(db.getProgress(scope)).toMatchObject({
     after: 'apple',
     cursor: 'next-base',
@@ -138,7 +144,7 @@ it('keeps the active catalog across a restart until staged pages and catchup com
     deleted_ids: [],
     cursor: 'next',
     has_more: false,
-    scale_profile: { ...profile, prefix: '22' },
+    scale_profile: { ...profile, prefix: '22', revision: 1 },
   });
   db.finishSync(scope, '2026-10-11T02:00:00Z');
   expect(db.allProducts(scope)[0].retail_price).toBe('200.00');
@@ -162,11 +168,12 @@ it('rolls back products and cursor together when SQLite rejects part of a delta'
       deleted_ids: [],
       cursor: 'not-committed',
       has_more: false,
-      scale_profile: profile,
+      scale_profile: { ...profile, prefix: '27', revision: 5 },
     }),
   ).toThrow();
   expect(db.allProducts(scope)[0].retail_price).toBe('100.00');
   expect(db.getProgress(scope)?.cursor).toBe('done');
+  expect(db.getProfile(scope)?.revision).toBe(0);
 });
 
 it('keeps the previous complete catalog visible during an interrupted multi-page delta', () => {
@@ -177,10 +184,10 @@ it('keeps the previous complete catalog visible during an interrupted multi-page
     deleted_ids: [],
     cursor: 'partial',
     has_more: true,
-    scale_profile: { ...profile, prefix: '22' },
+    scale_profile: { ...profile, prefix: '22', revision: 1 },
   });
   expect(db.allProducts(scope)[0].retail_price).toBe('100.00');
-  expect(db.getState(scope).profile?.prefix).toBe('21');
+  expect(db.getState(scope).profile?.prefix).toBe('22');
   db.close();
   databases.splice(databases.indexOf(db), 1);
   const resumed = open(path).db;
@@ -191,7 +198,7 @@ it('keeps the previous complete catalog visible during an interrupted multi-page
     deleted_ids: [],
     cursor: 'complete',
     has_more: false,
-    scale_profile: { ...profile, prefix: '22' },
+    scale_profile: { ...profile, prefix: '22', revision: 1 },
   });
   resumed.finishSync(scope, '2026-10-11T03:00:00Z');
   expect(resumed.allProducts(scope)[0].retail_price).toBe('500.00');
@@ -625,7 +632,10 @@ it('persists a confirmed clear without removing local products, settings or uplo
   expect(reopened.getLatestClear(scope)).toEqual(job);
   expect(reopened.uploadedProducts(scope, upload.device)).toEqual([]);
   expect(reopened.allProducts(scope)).toEqual([product]);
-  expect(reopened.getDevice(scope)).toEqual(upload.device);
+  expect(reopened.getDevice(scope)).toEqual({
+    ...upload.device,
+    reloadRequired: true,
+  });
   expect(reopened.getLatestUpload(scope)).toEqual(upload);
   for (const field of [
     'apiUrl',
@@ -635,6 +645,42 @@ it('persists a confirmed clear without removing local products, settings or uplo
     'storeId',
   ] as const)
     expect(reopened.getLatestClear({ ...scope, [field]: 'other' })).toBeNull();
+});
+
+it('persists endpoint-wide full reload requirements at the clear ACK before disconnect and preserves later completed reloads', () => {
+  const { db, path } = open();
+  const device = uploadJob('target').device;
+  const otherScope = { ...scope, storeId: 'other-store' };
+  const otherDevice = { ...device, scaleIp: '192.168.1.87' };
+  const unrelatedScope = { ...scope, storeId: 'third-store' };
+  db.saveDevice(scope, device);
+  db.saveDevice(otherScope, device);
+  db.saveDevice(unrelatedScope, otherDevice);
+  const clearing = clearJob('crash-during-disconnect', 'acknowledged');
+  db.saveClear(clearing);
+  db.close();
+  databases.splice(databases.indexOf(db), 1);
+  const reopened = open(path).db;
+  expect(reopened.getLatestClear(scope)).toMatchObject({
+    commandState: 'acknowledged',
+    status: 'interrupted',
+  });
+  expect(reopened.getDevice(scope)).toEqual({
+    ...device,
+    reloadRequired: true,
+  });
+  expect(reopened.getDevice(otherScope)).toEqual({
+    ...device,
+    reloadRequired: true,
+  });
+  expect(reopened.getDevice(unrelatedScope)).toEqual(otherDevice);
+  reopened.saveDevice(scope, { ...device, reloadRequired: false });
+  reopened.saveClear({
+    ...clearing,
+    status: 'completed',
+    finishedAt: '2026-10-16T00:00:00Z',
+  });
+  expect(reopened.getDevice(scope)?.reloadRequired).toBe(false);
 });
 
 it.each([
@@ -790,6 +836,7 @@ it('adds clear persistence to a version 2 database without rewriting its upload 
   const legacy = new DatabaseSync(path);
   legacy.exec(`
     CREATE TABLE catalog_uploads(sequence INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,scope TEXT NOT NULL,device TEXT NOT NULL,device_scope TEXT NOT NULL,value TEXT NOT NULL);
+    CREATE TABLE catalog_devices(scope TEXT PRIMARY KEY,value TEXT NOT NULL);
     CREATE TABLE upload_items(job_id TEXT NOT NULL,ordinal INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(job_id,ordinal));
     CREATE TABLE upload_events(job_id TEXT NOT NULL,ordinal INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(job_id,ordinal));
     PRAGMA user_version=2;
@@ -831,4 +878,381 @@ it('adds clear persistence to a version 2 database without rewriting its upload 
   db.saveClear(clearJob('migrated-clear', 'acknowledged'));
   expect(db.getLatestUpload(scope)).toEqual(upload);
   expect(db.uploadedProducts(scope, upload.device)).toEqual([]);
+});
+
+it('keeps organization metadata current across stores, empty deltas and resumed pages', () => {
+  const { db } = open();
+  complete(db);
+  const otherStore = {
+    ...scope,
+    apiUrl: `${scope.apiUrl}/`,
+    storeId: 'other-store',
+  };
+  db.saveProfile(otherStore, {
+    ...profile,
+    prefix: '27',
+    revision: 3,
+    issued_plu_ranges: [[8, 10]],
+  });
+  expect(db.getState(scope).profile).toEqual({
+    ...profile,
+    prefix: '27',
+    revision: 3,
+    issued_plu_ranges: [
+      [1, 1],
+      [8, 10],
+    ],
+  });
+  db.applyChanges(scope, {
+    products: [],
+    deleted_ids: [],
+    cursor: 'new-metadata',
+    has_more: false,
+    scale_profile: {
+      ...profile,
+      prefix: '05',
+      revision: 2,
+      issued_plu_ranges: [[2, 4]],
+    },
+  });
+  db.finishSync(scope, '2026-10-15T00:00:00Z');
+  expect(db.getState(scope).profile).toMatchObject({
+    prefix: '27',
+    revision: 3,
+    issued_plu_ranges: [
+      [1, 4],
+      [8, 10],
+    ],
+  });
+  db.beginSnapshot(scope, 'fresh', profile);
+  db.applyPage(scope, [], 'next', {
+    ...profile,
+    prefix: '27',
+    revision: 3,
+    issued_plu_ranges: [[11, 11]],
+  });
+  expect(db.getProgress(scope)?.profile).toMatchObject({
+    prefix: '27',
+    revision: 3,
+    issued_plu_ranges: [
+      [1, 4],
+      [8, 11],
+    ],
+  });
+  expect(db.getProfile({ ...scope, organizationId: 'unrelated' })).toBeNull();
+  expect(
+    db.getProfile({ ...scope, apiUrl: 'https://other.test/v1' }),
+  ).toBeNull();
+});
+
+it('tracks the profile revision of the completed catalog independently of fresh metadata', () => {
+  const { db } = open();
+  complete(db);
+  expect(db.getState(scope).sync.profileRevision).toBe(0);
+  db.applyChanges(scope, {
+    products: [],
+    deleted_ids: [],
+    cursor: 'new-profile',
+    has_more: false,
+    scale_profile: { ...profile, prefix: '27', revision: 1 },
+  });
+  expect(db.getState(scope)).toMatchObject({
+    profile: { prefix: '27', revision: 1 },
+    sync: { profileRevision: 0 },
+  });
+  db.finishSync(scope, '2026-10-15T00:00:00Z');
+  expect(db.getState(scope).sync.profileRevision).toBe(1);
+});
+
+it('invalidates confirmations for the same organization on a profile change but preserves connection settings', () => {
+  const { db } = open();
+  const device = uploadJob('device').device;
+  const otherStore = { ...scope, storeId: 'other' };
+  const otherOrganization = { ...scope, organizationId: 'other' };
+  for (const candidate of [scope, otherStore, otherOrganization])
+    db.saveDevice(candidate, device);
+  db.saveProfile(scope, profile);
+  expect(db.getDevice(scope)?.setupConfirmed).toBe(true);
+  db.saveProfile(scope, { ...profile, issued_plu_ranges: [[1, 3]] });
+  expect(db.getDevice(scope)?.setupConfirmed).toBe(true);
+  db.saveProfile(scope, { ...profile, prefix: '27', revision: 1 });
+  expect(db.getDevice(scope)).toEqual({
+    ...device,
+    setupConfirmed: false,
+    reloadRequired: true,
+  });
+  expect(db.getDevice(otherStore)?.setupConfirmed).toBe(false);
+  expect(db.getDevice(otherOrganization)?.setupConfirmed).toBe(true);
+  db.saveDevice(scope, { ...device, barcodePrefix: '27', profileRevision: 1 });
+  db.saveProfile(scope, { ...profile, prefix: '05', revision: 0 });
+  expect(db.getDevice(scope)?.setupConfirmed).toBe(true);
+  db.saveProfile(scope, { ...profile, prefix: '27', revision: 2 });
+  expect(db.getDevice(scope)?.setupConfirmed).toBe(false);
+});
+
+it('migrates legacy active and staged metadata without losing products, cursors or operation history', () => {
+  const first = open();
+  complete(first.db);
+  const upload = {
+    ...uploadJob('preserved-upload', 'acknowledged'),
+    status: 'completed' as const,
+    finishedAt: 'done',
+  };
+  const clear = {
+    ...clearJob('preserved-clear', 'acknowledged'),
+    status: 'completed' as const,
+    finishedAt: 'done',
+  };
+  first.db.saveUpload(upload);
+  first.db.saveClear(clear);
+  first.db.saveDevice(scope, upload.device);
+  first.db.beginSnapshot(scope, 'resume-cursor', profile);
+  first.db.applyPage(scope, [{ ...product, id: 'staged' }], 'staged');
+  first.db.close();
+  databases.splice(databases.indexOf(first.db), 1);
+  const legacy = new DatabaseSync(first.path);
+  const stateRow = legacy
+    .prepare('SELECT scope,value FROM catalog_state')
+    .get()!;
+  const state = JSON.parse(String(stateRow.value));
+  state.profile = {
+    format: profile.format,
+    prefix: '05',
+    enabled: true,
+    blocked_reason: 'barcode_conflict',
+  };
+  state.progress.profile = {
+    ...profile,
+    prefix: '27',
+    revision: 4,
+    issued_plu_ranges: [[12, 14]],
+  };
+  legacy
+    .prepare('UPDATE catalog_state SET value=? WHERE scope=?')
+    .run(JSON.stringify(state), String(stateRow.scope));
+  legacy.exec('DROP TABLE IF EXISTS catalog_profiles; PRAGMA user_version=3;');
+  legacy.close();
+  const { db } = open(first.path);
+  expect(db.getState(scope).profile).toMatchObject({
+    prefix: '27',
+    revision: 4,
+    issued_plu_ranges: [[12, 14]],
+  });
+  expect(db.getProgress(scope)).toMatchObject({
+    cursor: 'resume-cursor',
+    after: 'staged',
+    profile: { prefix: '27', revision: 4 },
+  });
+  expect(db.allProducts(scope)).toEqual([product]);
+  expect(db.getLatestUpload(scope)).toEqual(upload);
+  expect(db.getLatestClear(scope)).toEqual(clear);
+  expect(db.getDevice(scope)).toEqual({
+    ...upload.device,
+    setupConfirmed: false,
+    reloadRequired: true,
+  });
+  db.applyPage(scope, [], null);
+  db.applyChanges(scope, {
+    products: [],
+    deleted_ids: [],
+    cursor: 'done-again',
+    has_more: false,
+    scale_profile: profile,
+  });
+  db.finishSync(scope, '2026-10-15T01:00:00Z');
+  expect(db.allProducts(scope)).toEqual([{ ...product, id: 'staged' }]);
+  expect(db.getState(scope).profile?.prefix).toBe('27');
+});
+
+it('adds revision defaults to legacy profiles with no staged metadata', () => {
+  const first = open();
+  complete(first.db);
+  first.db.close();
+  databases.splice(databases.indexOf(first.db), 1);
+  const legacy = new DatabaseSync(first.path);
+  const row = legacy.prepare('SELECT scope,value FROM catalog_state').get()!;
+  const state = JSON.parse(String(row.value));
+  state.profile = {
+    format: profile.format,
+    prefix: '05',
+    enabled: true,
+    blocked_reason: 'barcode_conflict',
+  };
+  legacy.prepare('UPDATE catalog_state SET value=?').run(JSON.stringify(state));
+  legacy.exec('DROP TABLE IF EXISTS catalog_profiles; PRAGMA user_version=3;');
+  legacy.close();
+  const { db } = open(first.path);
+  expect(db.getState(scope).profile).toEqual({
+    format: profile.format,
+    prefix: '05',
+    enabled: true,
+    blocked_reason: 'barcode_conflict',
+    revision: 0,
+    issued_plu_ranges: [],
+  });
+  expect(db.getProgress(scope)).toMatchObject({
+    cursor: 'done',
+    profile: { revision: 0 },
+  });
+  db.applyChanges(scope, {
+    products: [],
+    deleted_ids: [],
+    cursor: 'fresh-contract',
+    has_more: false,
+    scale_profile: { ...profile, prefix: '27', revision: 0 },
+  });
+  expect(db.getProfile(scope)).toMatchObject({
+    prefix: '27',
+    blocked_reason: null,
+    revision: 0,
+  });
+  expect(db.getProgress(scope)?.cursor).toBe('fresh-contract');
+  db.saveProfile(scope, { ...profile, prefix: '05', revision: 0 });
+  expect(db.getProfile(scope)?.prefix).toBe('27');
+  db.finishSync(scope, '2026-10-15T00:00:00Z');
+  expect(db.allProducts(scope)).toEqual([product]);
+});
+
+it('collects the latest acknowledged packets for the current profile across upload groups', () => {
+  const { db } = open();
+  const first = {
+    ...uploadJob('first-group', 'acknowledged'),
+    profileRevision: 2,
+  };
+  first.device.barcodePrefix = '27';
+  first.items[0].packetHex = 'first-apple';
+  db.saveUpload(first);
+  const next = {
+    ...uploadJob('next-group', 'acknowledged'),
+    profileRevision: 2,
+  };
+  next.scope = {
+    ...scope,
+    userId: 'another-user',
+    membershipId: 'another-membership',
+  };
+  next.device.barcodePrefix = '27';
+  next.items = [
+    { ...next.items[0], packetHex: 'latest-apple' },
+    {
+      ...next.items[0],
+      product: { ...product, id: 'pear' },
+      packetHex: 'pear',
+    },
+  ];
+  db.saveUpload(next);
+  expect(db.uploadedPackets(scope, first.device, 2)).toEqual(
+    new Map([
+      ['apple', 'latest-apple'],
+      ['pear', 'pear'],
+    ]),
+  );
+});
+
+it.each([
+  { profileRevision: 1, barcodePrefix: '27' },
+  { profileRevision: undefined, barcodePrefix: '27' },
+  { profileRevision: 2, barcodePrefix: '05' },
+])(
+  'does not reuse a previous packet after a latest ACK from mismatched metadata: %o',
+  (metadata) => {
+    const { db } = open();
+    const verified = {
+      ...uploadJob('verified', 'acknowledged'),
+      profileRevision: 2,
+    };
+    verified.device.barcodePrefix = '27';
+    db.saveUpload(verified);
+    const changed = {
+      ...uploadJob('changed', 'acknowledged'),
+      profileRevision: metadata.profileRevision,
+    };
+    changed.device.barcodePrefix = metadata.barcodePrefix;
+    db.saveUpload(changed);
+    expect(db.uploadedPackets(scope, verified.device, 2)).toEqual(new Map());
+  },
+);
+
+it.each(['uncertain', 'in_flight'] as const)(
+  'invalidates older confirmed packets after a latest %s write',
+  (state) => {
+    const { db } = open();
+    const verified = {
+      ...uploadJob('verified', 'acknowledged'),
+      profileRevision: 0,
+    };
+    db.saveUpload(verified);
+    db.saveUpload({ ...uploadJob('uncertain', state), profileRevision: 1 });
+    expect(db.uploadedPackets(scope, verified.device, 0)).toEqual(new Map());
+    expect(db.uncertainProducts(scope, verified.device)).toEqual(
+      new Set(['apple']),
+    );
+  },
+);
+
+it('does not treat a legacy ACK without a revision as verified revision zero', () => {
+  const { db } = open();
+  const legacy = uploadJob('legacy-ack', 'acknowledged');
+  db.saveUpload(legacy);
+  expect(db.uploadedPackets(scope, legacy.device, 0)).toEqual(new Map());
+});
+
+it('isolates uploaded packets by organization, store, API and endpoint', () => {
+  const { db } = open();
+  const verified = {
+    ...uploadJob('verified', 'acknowledged'),
+    profileRevision: 2,
+  };
+  verified.items[0].packetHex = 'verified-packet';
+  db.saveUpload(verified);
+  const otherScopes = [
+    { ...scope, organizationId: 'other-organization' },
+    { ...scope, storeId: 'other-store' },
+    { ...scope, apiUrl: 'https://other-api.test/v1' },
+  ];
+  for (const [index, otherScope] of otherScopes.entries())
+    db.saveUpload({
+      ...uploadJob(`scope-${index}`, 'acknowledged'),
+      scope: otherScope,
+      profileRevision: 2,
+    });
+  const otherIp = {
+    ...uploadJob('other-ip', 'acknowledged'),
+    profileRevision: 2,
+  };
+  otherIp.device.scaleIp = '192.168.1.10';
+  db.saveUpload(otherIp);
+  const otherPort = {
+    ...uploadJob('other-port', 'acknowledged'),
+    profileRevision: 2,
+  };
+  otherPort.device.port = 5001;
+  db.saveUpload(otherPort);
+  expect(
+    db.uploadedPackets(
+      { ...scope, apiUrl: `${scope.apiUrl}/` },
+      verified.device,
+      2,
+    ),
+  ).toEqual(new Map([['apple', 'verified-packet']]));
+});
+
+it('resets known uploaded packets after a confirmed clear and accepts subsequent uploads', () => {
+  const { db } = open();
+  const verified = {
+    ...uploadJob('verified', 'acknowledged'),
+    profileRevision: 2,
+  };
+  db.saveUpload(verified);
+  db.saveClear(clearJob('clear', 'acknowledged'));
+  expect(db.uploadedPackets(scope, verified.device, 2)).toEqual(new Map());
+  const after = {
+    ...uploadJob('after-clear', 'acknowledged'),
+    profileRevision: 2,
+  };
+  after.items[0].packetHex = 'new-packet';
+  db.saveUpload(after);
+  expect(db.uploadedPackets(scope, verified.device, 2)).toEqual(
+    new Map([['apple', 'new-packet']]),
+  );
 });

@@ -354,32 +354,37 @@ describe('sequential catalog upload', () => {
     },
   );
 
-  it('cancels an outstanding write as uncertain and disconnects without sending another product', async () => {
-    const controller = new AbortController();
-    const server = await fakeScale((packet, peer, socket) => {
-      if (packet[0] === 0x0b) controller.abort();
-      else
-        socket.send(
-          packet[1] === 3 ? capabilities() : Buffer.from([2]),
-          peer.port,
-          peer.address,
-        );
-    });
-    const result = await runUpload(
-      job(server.port),
-      controller.signal,
-      async () => {},
-      { timeoutMs: 50 },
-    );
-    expect(result.status).toBe('cancelled');
-    expect(result.items.map((item) => item.state)).toEqual([
-      'uncertain',
-      'pending',
-    ]);
-    expect(server.packets.at(-1)?.subarray(0, 3).toString('hex')).toBe(
-      '0e0200',
-    );
-  });
+  it.each([null, 'Профиль изменился. Требуется настройка.'])(
+    'cancels an outstanding write as uncertain without sending another product (reason: %s)',
+    async (reason) => {
+      const controller = new AbortController();
+      const server = await fakeScale((packet, peer, socket) => {
+        if (packet[0] === 0x0b)
+          controller.abort(reason ? new Error(reason) : undefined);
+        else
+          socket.send(
+            packet[1] === 3 ? capabilities() : Buffer.from([2]),
+            peer.port,
+            peer.address,
+          );
+      });
+      const result = await runUpload(
+        job(server.port),
+        controller.signal,
+        async () => {},
+        { timeoutMs: 50 },
+      );
+      expect(result.status).toBe('cancelled');
+      expect(result.error).toBe(reason ?? 'Загрузка отменена');
+      expect(result.items.map((item) => item.state)).toEqual([
+        'uncertain',
+        'pending',
+      ]);
+      expect(server.packets.at(-1)?.subarray(0, 3).toString('hex')).toBe(
+        '0e0200',
+      );
+    },
+  );
 
   it('keeps unsent items pending when cancellation arrives during durable intent', async () => {
     const controller = new AbortController();

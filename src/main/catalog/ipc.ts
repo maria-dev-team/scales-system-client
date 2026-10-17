@@ -14,6 +14,13 @@ const deviceSchema = z
     nameEncoding: z.enum(['ascii', 'windows-1251']),
     barcodePrefix: z.string().regex(/^\d{2}$/),
     setupConfirmed: z.boolean(),
+    reloadRequired: z.boolean().optional(),
+    profileRevision: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER)
+      .optional(),
   })
   .strict()
   .superRefine((device, context) => {
@@ -95,6 +102,7 @@ const fieldLabels: Record<string, string> = {
   'device.nameEncoding': 'кодировка названий',
   'device.barcodePrefix': 'префикс штрихкода',
   'device.setupConfirmed': 'проверка настройки весов',
+  'device.profileRevision': 'ревизия профиля весов',
   productIds: 'выбранные товары',
   confirmUncertain: 'разрешение повторной записи',
   revision: 'результат подготовки загрузки',

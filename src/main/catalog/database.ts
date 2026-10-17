@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { z } from 'zod';
 
 import type {
   CatalogProduct,
@@ -10,6 +11,7 @@ import type {
   ScaleDevice,
   UploadJob,
 } from '../../shared/catalog';
+import { mergeScaleProfiles, scaleProfileSchema } from './profile';
 
 export const scopeKey = (scope: CatalogScope): string =>
   JSON.stringify([
@@ -19,6 +21,22 @@ export const scopeKey = (scope: CatalogScope): string =>
     scope.organizationId,
     scope.storeId,
   ]);
+const organizationKey = (
+  scope: Pick<CatalogScope, 'apiUrl' | 'organizationId'>,
+): string =>
+  JSON.stringify([
+    new URL(scope.apiUrl).href.replace(/\/$/, ''),
+    scope.organizationId,
+  ]);
+const storedScopeOrganizationKey = (key: string): string => {
+  const [apiUrl, , , organizationId] = JSON.parse(key) as string[];
+  return organizationKey({ apiUrl, organizationId });
+};
+const legacyProfileSchema = scaleProfileSchema.extend({
+  blocked_reason: z.enum(['barcode_conflict']).nullable(),
+  revision: scaleProfileSchema.shape.revision.default(0),
+  issued_plu_ranges: scaleProfileSchema.shape.issued_plu_ranges.default([]),
+});
 const deviceKey = (device: ScaleDevice): string =>
   JSON.stringify([device.scaleIp, device.port]);
 const deviceScopeKey = (scope: CatalogScope): string =>
@@ -150,6 +168,47 @@ export class CatalogDatabase {
         `);
       });
     }
+    if (
+      Number(this.db.prepare('PRAGMA user_version').get()?.user_version) < 4
+    ) {
+      this.transaction(() => {
+        this.db.exec(
+          'CREATE TABLE catalog_profiles(organization TEXT PRIMARY KEY,value TEXT NOT NULL,authoritative INTEGER NOT NULL DEFAULT 1);',
+        );
+        if (
+          this.db
+            .prepare(
+              "SELECT name FROM sqlite_master WHERE type='table' AND name='catalog_state'",
+            )
+            .get()
+        ) {
+          for (const row of this.db
+            .prepare('SELECT scope,value FROM catalog_state')
+            .all()) {
+            const state = JSON.parse(String(row.value)) as StoredState;
+            const [apiUrl, userId, membershipId, organizationId, storeId] =
+              JSON.parse(String(row.scope)) as string[];
+            const scope = {
+              apiUrl,
+              userId,
+              membershipId,
+              organizationId,
+              storeId,
+              storeName: '',
+            };
+            for (const candidate of [state.profile, state.progress?.profile]) {
+              if (candidate)
+                this.writeProfile(
+                  scope,
+                  legacyProfileSchema.parse(candidate),
+                  candidate.revision !== undefined,
+                );
+            }
+          }
+        }
+        this.db.exec('PRAGMA user_version=4;');
+      });
+    }
     this.transaction(() => {
       // Outcomes are checkpointed before disconnect finishes. A terminal status
       // without finishedAt still represents an operation interrupted by exit.
@@ -226,12 +285,74 @@ export class CatalogDatabase {
       )
       .run(scopeKey(scope), JSON.stringify(state));
   }
+  getProfile(scope: CatalogScope): ScaleBarcodeProfile | null {
+    const row = this.db
+      .prepare('SELECT value FROM catalog_profiles WHERE organization=?')
+      .get(organizationKey(scope));
+    return row ? (JSON.parse(String(row.value)) as ScaleBarcodeProfile) : null;
+  }
+  saveProfile(
+    scope: CatalogScope,
+    profile: ScaleBarcodeProfile,
+  ): ScaleBarcodeProfile {
+    return this.transaction(() => this.writeProfile(scope, profile));
+  }
+  private writeProfile(
+    scope: CatalogScope,
+    incoming: ScaleBarcodeProfile,
+    authoritative = true,
+  ): ScaleBarcodeProfile {
+    const current = this.getProfile(scope);
+    const organization = organizationKey(scope);
+    const known =
+      this.db
+        .prepare(
+          'SELECT authoritative FROM catalog_profiles WHERE organization=?',
+        )
+        .get(organization)?.authoritative === 1;
+    const merged = mergeScaleProfiles(current, incoming);
+    // Legacy cached settings predate revisions and cannot outrank the first server profile.
+    const profile =
+      current && !known && authoritative
+        ? { ...incoming, issued_plu_ranges: merged.issued_plu_ranges }
+        : merged;
+    this.db
+      .prepare(
+        'INSERT INTO catalog_profiles(organization,value,authoritative) VALUES (?,?,?) ON CONFLICT(organization) DO UPDATE SET value=excluded.value,authoritative=excluded.authoritative',
+      )
+      .run(
+        organization,
+        JSON.stringify(profile),
+        Number(known || authoritative),
+      );
+    if (
+      current &&
+      (profile.revision !== current.revision ||
+        profile.prefix !== current.prefix ||
+        profile.enabled !== current.enabled)
+    ) {
+      for (const row of this.db
+        .prepare('SELECT scope,value FROM catalog_devices')
+        .all()) {
+        if (storedScopeOrganizationKey(String(row.scope)) !== organization)
+          continue;
+        const device = JSON.parse(String(row.value)) as ScaleDevice;
+        device.setupConfirmed = false;
+        device.reloadRequired = true;
+        this.db
+          .prepare('UPDATE catalog_devices SET value=? WHERE scope=?')
+          .run(JSON.stringify(device), String(row.scope));
+      }
+    }
+    return profile;
+  }
   beginSnapshot(
     scope: CatalogScope,
     cursor: string,
     profile: ScaleBarcodeProfile,
   ): void {
     this.transaction(() => {
+      profile = this.writeProfile(scope, profile);
       const state = this.state(scope);
       if (state.staging)
         this.db
@@ -256,16 +377,17 @@ export class CatalogDatabase {
   }
   getProgress(scope: CatalogScope): CatalogProgress | null {
     const state = this.state(scope);
+    const profile = this.getProfile(scope);
     return (
-      state.progress ??
-      (state.cursor && state.profile
+      (state.progress && profile ? { ...state.progress, profile } : null) ??
+      (state.cursor && profile
         ? {
             cursor: state.cursor,
             after: null,
             phase: 'changes',
             loaded: 0,
             staging: false,
-            profile: state.profile,
+            profile,
             hasMore: false,
             waiting: false,
           }
@@ -293,11 +415,13 @@ export class CatalogDatabase {
     scope: CatalogScope,
     products: CatalogProduct[],
     next: string | null,
+    profile?: ScaleBarcodeProfile,
   ): void {
     this.transaction(() => {
       const state = this.state(scope);
       if (!state.staging || !state.progress || state.progress.phase !== 'pages')
         throw new Error('Нет незавершённой загрузки каталога.');
+      if (profile) state.progress.profile = this.writeProfile(scope, profile);
       this.writeProducts(scope, state.staging, products);
       state.progress = {
         ...state.progress,
@@ -342,7 +466,7 @@ export class CatalogDatabase {
         ...progress,
         staging: state.staging !== null,
         cursor: changes.cursor,
-        profile: changes.scale_profile,
+        profile: this.writeProfile(scope, changes.scale_profile),
         loaded:
           progress.loaded +
           changes.products.length +
@@ -373,12 +497,13 @@ export class CatalogDatabase {
       state.active = state.staging ?? state.active;
       state.staging = null;
       state.cursor = progress.cursor;
-      state.profile = progress.profile;
+      state.profile = this.getProfile(scope);
       state.progress = null;
       state.sync = {
         phase: 'idle',
         loaded: progress.loaded,
         lastSyncedAt: at,
+        profileRevision: state.profile?.revision ?? 0,
         error: null,
       };
       this.writeState(scope, state);
@@ -408,7 +533,7 @@ export class CatalogDatabase {
         )
         .get(scopeKey(scope), state.active)?.total ?? 0,
     );
-    return { sync: state.sync, profile: state.profile, total };
+    return { sync: state.sync, profile: this.getProfile(scope), total };
   }
   listProducts(
     scope: CatalogScope,
@@ -447,6 +572,9 @@ export class CatalogDatabase {
       .all(scopeKey(scope), this.state(scope).active)
       .map((row) => JSON.parse(String(row.value)) as CatalogProduct);
   }
+  getCatalogGeneration(scope: CatalogScope): string {
+    return this.state(scope).active;
+  }
   saveDevice(scope: CatalogScope, device: ScaleDevice): void {
     this.db
       .prepare(
@@ -476,12 +604,28 @@ export class CatalogDatabase {
       let historyResetSequence = previous?.history_reset_sequence ?? null;
       // Only the first durable ACK invalidates previous contents. Disconnect
       // checkpoints must not invalidate uploads created after that ACK.
-      if (historyResetSequence === null && job.commandState === 'acknowledged')
+      if (
+        historyResetSequence === null &&
+        job.commandState === 'acknowledged'
+      ) {
         historyResetSequence = this.db
           .prepare(
             'SELECT COALESCE(MAX(sequence),0) AS sequence FROM catalog_uploads',
           )
           .get()!.sequence;
+        for (const row of this.db
+          .prepare('SELECT scope,value FROM catalog_devices')
+          .all()) {
+          const savedDevice = JSON.parse(String(row.value)) as ScaleDevice;
+          if (deviceKey(savedDevice) !== device) continue;
+          this.db
+            .prepare('UPDATE catalog_devices SET value=? WHERE scope=?')
+            .run(
+              JSON.stringify({ ...savedDevice, reloadRequired: true }),
+              String(row.scope),
+            );
+        }
+      }
       this.db
         .prepare(
           'INSERT INTO catalog_clears(id,scope,device,value,history_reset_sequence) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value,history_reset_sequence=excluded.history_reset_sequence',
@@ -624,25 +768,48 @@ export class CatalogDatabase {
   private deviceHistory(
     scope: CatalogScope,
     device: ScaleDevice,
-  ): UploadJob['items'] {
+  ): Array<{
+    item: UploadJob['items'][number];
+    profileRevision: unknown;
+    barcodePrefix: unknown;
+  }> {
     return this.db
       .prepare(
-        `SELECT i.value FROM catalog_uploads j JOIN upload_items i ON i.job_id=j.id WHERE j.device_scope=? AND j.device=? AND j.sequence>COALESCE((SELECT MAX(history_reset_sequence) FROM catalog_clears WHERE device=j.device),0) AND json_extract(i.value,'$.state') IN ('acknowledged','uncertain','in_flight') ORDER BY j.sequence,i.ordinal`,
+        `SELECT i.value,json_extract(j.value,'$.profileRevision') AS profile_revision,json_extract(j.value,'$.device.barcodePrefix') AS barcode_prefix FROM catalog_uploads j JOIN upload_items i ON i.job_id=j.id WHERE j.device_scope=? AND j.device=? AND j.sequence>COALESCE((SELECT MAX(history_reset_sequence) FROM catalog_clears WHERE device=j.device),0) AND json_extract(i.value,'$.state') IN ('acknowledged','uncertain','in_flight') ORDER BY j.sequence,i.ordinal`,
       )
       .all(deviceScopeKey(scope), deviceKey(device))
-      .map(
-        (row) => JSON.parse(String(row.value)) as UploadJob['items'][number],
-      );
+      .map((row) => ({
+        item: JSON.parse(String(row.value)) as UploadJob['items'][number],
+        profileRevision: row.profile_revision,
+        barcodePrefix: row.barcode_prefix,
+      }));
   }
   uploadedProducts(scope: CatalogScope, device: ScaleDevice): CatalogProduct[] {
     const products = new Map<string, CatalogProduct>();
-    for (const item of this.deviceHistory(scope, device))
+    for (const { item } of this.deviceHistory(scope, device))
       products.set(item.product.id, item.product);
     return [...products.values()];
   }
+  uploadedPackets(
+    scope: CatalogScope,
+    device: ScaleDevice,
+    profileRevision: number,
+  ): Map<string, string> {
+    const packets = new Map<string, string>();
+    for (const entry of this.deviceHistory(scope, device)) {
+      packets.delete(entry.item.product.id);
+      if (
+        entry.item.state === 'acknowledged' &&
+        entry.profileRevision === profileRevision &&
+        entry.barcodePrefix === device.barcodePrefix
+      )
+        packets.set(entry.item.product.id, entry.item.packetHex);
+    }
+    return packets;
+  }
   uncertainProducts(scope: CatalogScope, device: ScaleDevice): Set<string> {
     const uncertain = new Set<string>();
-    for (const item of this.deviceHistory(scope, device)) {
+    for (const { item } of this.deviceHistory(scope, device)) {
       if (item.state === 'acknowledged') uncertain.delete(item.product.id);
       else uncertain.add(item.product.id);
     }

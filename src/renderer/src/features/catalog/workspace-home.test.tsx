@@ -23,6 +23,8 @@ const saved = (): CatalogState => ({
     prefix: '22',
     enabled: true,
     blocked_reason: null,
+    revision: 0,
+    issued_plu_ranges: [[1, 1]],
   },
   device: {
     scaleIp: '192.168.1.87',
@@ -31,6 +33,7 @@ const saved = (): CatalogState => ({
     nameEncoding: 'windows-1251',
     barcodePrefix: '22',
     setupConfirmed: true,
+    profileRevision: 0,
   },
 });
 
@@ -96,6 +99,12 @@ describe('workspace home', () => {
       'Нужна проверка этикетки',
       (state: CatalogState): void => {
         state.device!.setupConfirmed = false;
+      },
+    ],
+    [
+      'Требуется настройка',
+      (state: CatalogState): void => {
+        state.profile!.revision = 1;
       },
     ],
     [
